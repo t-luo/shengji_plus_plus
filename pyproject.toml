@@ -1,0 +1,21 @@
+[project]
+name = "shengji-plus-plus"
+version = "0.1.0"
+description = "Deep reinforcement learning AI for the Tractor (Shengji) card game"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy",
+    "torch>=2.11.0",
+    "tqdm",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cuda" }
+torchvision = { index = "pytorch-cuda" }
+torchaudio = { index = "pytorch-cuda" }
