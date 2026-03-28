@@ -65,25 +65,24 @@ class DMCModule(StageModule):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
     def act(self, obs: Observation, epsilon=None, training=True):
-        def reward(a: Action) -> torch.Tensor:
-            *state_and_action, _ = self.prepare_batch_inputs([(obs, a, 0)])
-            return self._eval_model(*state_and_action).cpu().item()
-        
         if epsilon and random.random() < epsilon:
             return random.choice(obs.actions)
             # return random.choices(obs.actions, softmax([reward(a).cpu().item() for a in obs.actions]))[0]
         else:
+            *state_and_actions, _ = self.prepare_batch_inputs([(obs, a, 0) for a in obs.actions])
+            with torch.no_grad():
+                rewards = self._eval_model(*state_and_actions).cpu().squeeze(1).tolist()
+
             # If in verbose mode, log actions and their probabilities in test time
             if not training and logging.getLogger().level == logging.DEBUG:
                 logging.debug(f"Probability of actions ({obs.position.value}):")
-                rewards = list(map(reward, obs.actions))
                 exp_total = np.sum(np.exp(rewards))
                 sorted_actions = sorted(zip(obs.actions, rewards), key=lambda x: x[1], reverse=True)
                 for i, (action, rw) in enumerate(sorted_actions):
                     logging.debug(f"{i:2}. {action} (reward={round(rw, 4)}, prob={np.exp(rw) / exp_total:.4f})")
                 return sorted_actions[0][0]
             else:
-                return max(obs.actions, key=reward)
+                return max(zip(obs.actions, rewards), key=lambda x: x[1])[0]
 
 class DeclareModule(DMCModule):
     def prepare_batch_inputs(self, samples: List[Tuple[Observation, Action, float]]):
@@ -154,8 +153,7 @@ class MainModule(DMCModule):
 
         self.sac = sac
         self.use_oracle = use_oracle
-        self.log_alpha = torch.tensor(1.0).log().cuda()
-        self.log_alpha.requires_grad = True
+        self.log_alpha = torch.tensor(0.0, requires_grad=True)  # log(1.0) = 0.0, moved to device in load_models_from_disk
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=3e-4)
 
     def prepare_batch_inputs(self, samples: List[Tuple[Observation, Action, float, Tuple[Observation, float, float]]], training=True):
@@ -210,10 +208,9 @@ class MainModule(DMCModule):
         return x_batch.to(device), history_batch.to(device), current_action_entropy.to(device), next_action_entropy.to(device), gt_rewards.to(device)
 
     def act(self, obs: Observation, epsilon=None, training=True):
-        def reward(a: Action) -> torch.Tensor:
-            x_batch, history_batch, *_ = self.prepare_batch_inputs([(obs, a, 0, None)])
-            return self._eval_model(x_batch, history_batch).cpu().item()
-        rewards = list(map(reward, obs.actions))
+        x_batch, history_batch, *_ = self.prepare_batch_inputs([(obs, a, 0, None) for a in obs.actions])
+        with torch.no_grad():
+            rewards = self._eval_model(x_batch, history_batch).cpu().squeeze(1).tolist()
         action_distribution = np.exp(rewards) / np.sum(np.exp(rewards))
         entropy = -np.mean(action_distribution * np.log2(action_distribution))
         optimal_index = np.argmax(rewards)
@@ -336,7 +333,11 @@ class DMCAgent(SJAgent):
         else:
             loaded_models = False
         self.main_module.load_model(main_model)
-        
+
+        device = next(main_model.parameters()).device
+        self.main_module.log_alpha = self.main_module.log_alpha.to(device).detach().requires_grad_(True)
+        self.main_module.alpha_optimizer = torch.optim.Adam([self.main_module.log_alpha], lr=3e-4)
+
         return loaded_models, stats[-1]['iterations'] if loaded_models else 0
 
     def save_models_to_disk(self):
