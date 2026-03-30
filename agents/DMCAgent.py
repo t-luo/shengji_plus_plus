@@ -1,4 +1,5 @@
 from collections import deque
+import copy
 import logging
 import pickle
 import random
@@ -32,7 +33,7 @@ class DMCModule(StageModule):
     def load_model(self, model: nn.Module):
         self._model = model
         self._model.share_memory()
-        self._eval_model = pickle.loads(pickle.dumps(model)).to(next(model.parameters()).device)
+        self._eval_model = copy.deepcopy(model)
         self._eval_model.eval().share_memory()
         self.optimizer = torch.optim.RMSprop(model.parameters(), lr=0.0001, alpha=0.99, eps=1e-5)
 
@@ -64,14 +65,23 @@ class DMCModule(StageModule):
         for param, target_param in zip(self._model.parameters(), self._eval_model.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
+    def _eval_in_chunks(self, tensors: list, chunk_size: int = 32) -> list:
+        """Evaluate actions in chunks to bound activation memory per forward pass."""
+        n = tensors[0].shape[0]
+        results = []
+        with torch.no_grad():
+            for start in range(0, n, chunk_size):
+                chunk = [t[start:start + chunk_size] for t in tensors]
+                results.append(self._eval_model(*chunk).cpu())
+        return torch.cat(results, dim=0).squeeze(1).tolist()
+
     def act(self, obs: Observation, epsilon=None, training=True):
         if epsilon and random.random() < epsilon:
             return random.choice(obs.actions)
             # return random.choices(obs.actions, softmax([reward(a).cpu().item() for a in obs.actions]))[0]
         else:
             *state_and_actions, _ = self.prepare_batch_inputs([(obs, a, 0) for a in obs.actions])
-            with torch.no_grad():
-                rewards = self._eval_model(*state_and_actions).cpu().squeeze(1).tolist()
+            rewards = self._eval_in_chunks(state_and_actions)
 
             # If in verbose mode, log actions and their probabilities in test time
             if not training and logging.getLogger().level == logging.DEBUG:
@@ -209,8 +219,7 @@ class MainModule(DMCModule):
 
     def act(self, obs: Observation, epsilon=None, training=True):
         x_batch, history_batch, *_ = self.prepare_batch_inputs([(obs, a, 0, None) for a in obs.actions])
-        with torch.no_grad():
-            rewards = self._eval_model(x_batch, history_batch).cpu().squeeze(1).tolist()
+        rewards = self._eval_in_chunks([x_batch, history_batch])
         action_distribution = np.exp(rewards) / np.sum(np.exp(rewards))
         entropy = -np.mean(action_distribution * np.log2(action_distribution))
         optimal_index = np.argmax(rewards)

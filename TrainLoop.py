@@ -110,10 +110,17 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     oracle_duration_input = oracle_duration
 
-    try:
-        train_models = importlib.import_module(f"{model_folder}.Models".replace('/', '.'))
-    except:
-        train_models = importlib.import_module("networks.Models")
+    # Copy the active Models.py to networks/ActiveModels.py so spawn child
+    # processes can import it by a stable, fully-qualified module name.
+    _models_path = f"{model_folder}/Models.py"
+    if os.path.exists(_models_path):
+        shutil.copyfile(_models_path, "networks/ActiveModels.py")
+    else:
+        shutil.copyfile("networks/Models.py", "networks/ActiveModels.py")
+    import importlib
+    if "networks.ActiveModels" in sys.modules:
+        del sys.modules["networks.ActiveModels"]
+    train_models = importlib.import_module("networks.ActiveModels")
 
     agent: SJAgent
     iterations = 0
@@ -139,10 +146,12 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
                 eval_state = pickle.load(f)
         except:
             raise FileNotFoundError("State file for comparison model not found")
-        try:
-            eval_models = importlib.import_module(f'{compare}.Models'.replace('/', '.'))
-        except:
-            eval_models = importlib.import_module("networks.Models")
+        _eval_models_path = f"{compare}/Models.py"
+        _eval_src = _eval_models_path if os.path.exists(_eval_models_path) else "networks/Models.py"
+        shutil.copyfile(_eval_src, "networks/EvalModels.py")
+        if "networks.EvalModels" in sys.modules:
+            del sys.modules["networks.EvalModels"]
+        eval_models = importlib.import_module("networks.EvalModels")
 
         if eval_state.get('agent_type', 'dmc') in ('dqn', 'dqnsac', 'sac'):
             eval_agent = DQNAgent(compare, sac=eval_state['agent_type'].endwith('sac'))

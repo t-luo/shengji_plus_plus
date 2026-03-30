@@ -1,4 +1,5 @@
 
+import copy
 import logging
 import random
 import sys
@@ -35,7 +36,7 @@ class DeepAgent(StageModule):
         import pickle
         self.name = name
         self.model = model
-        self.eval_model = pickle.loads(pickle.dumps(model)).to(next(model.parameters()).device)
+        self.eval_model = copy.deepcopy(model)
         self.eval_model.eval()
         self.optimizer = torch.optim.RMSprop(model.parameters(), lr=0.0001, alpha=0.99, eps=1e-5)
         self.tau = tau

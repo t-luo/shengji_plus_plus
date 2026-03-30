@@ -1,4 +1,6 @@
 __pycache__
+networks/ActiveModels.py
+networks/EvalModels.py
 **/*.pt
 *.png
 slurm_logs
