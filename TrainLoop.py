@@ -3,6 +3,7 @@ import logging
 import pickle
 import random
 import shutil
+import time
 from torch.multiprocessing import Process, Lock, Queue
 import torch, os, sys
 from Simulation import Simulation
@@ -102,7 +103,7 @@ def evaluator(idx: int, player1: SJAgent, player2: SJAgent, enable_chaodi: bool,
     
 
 
-def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_size: int, compare: str = None, discount=0.99, decay_factor=1.2, chaodi=True, combos=False, verbose=False, random_seed=1, single_process=False, epsilon=0.01, tau=0.995, kitty_agent='fc', eval_agent_type='random', learn_from_eval=False, reuse_times=0, oracle_duration=0, max_games=500000, combo_penalty=0.1, dynamic_encoding=True, combo_alternation=False, actor_process_count=6, eval_process_count=7):
+def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_size: int, compare: str = None, discount=0.99, decay_factor=1.2, chaodi=True, combos=False, verbose=False, random_seed=1, single_process=False, epsilon=0.01, tau=0.995, kitty_agent='fc', eval_agent_type='random', learn_from_eval=False, reuse_times=0, oracle_duration=0, max_games=500000, combo_penalty=0.1, dynamic_encoding=True, combo_alternation=False, actor_process_count=6, eval_process_count=7, model_architecture='mlp'):
     os.makedirs(model_folder, exist_ok=True)
     torch.manual_seed(0)
     random.seed(random_seed)
@@ -181,7 +182,10 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
             agent.load_optimizer_states(state)
     except:
         print("Starting new training session")
-        shutil.copyfile('networks/Models.py', f'{model_folder}/Models.py')
+        if model_architecture == 'transformer':
+            shutil.copyfile('networks/TransformerModels.py', f'{model_folder}/Models.py')
+        else:
+            shutil.copyfile('networks/Models.py', f'{model_folder}/Models.py')
     
     if not eval_only:
         for i in range(1 if single_process else actor_process_count):
@@ -194,6 +198,7 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
     while iterations < max_games or eval_only:
         if not eval_only:
             print(f"Training iterations {iterations}-{iterations + games}...")
+            t0 = time.monotonic()
             for _ in tqdm.tqdm(range(0, games, 10)):
                 declare_batch = global_declare_queue.get()
                 kitty_batch = global_kitty_queue.get()
@@ -203,7 +208,9 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
                 agent.learn_from_samples(kitty_batch, Stage.kitty_stage)
                 agent.learn_from_samples(chaodi_batch, Stage.chaodi_stage)
                 agent.learn_from_samples(main_batch, Stage.main_stage)
+            training_time = time.monotonic() - t0
             agent.save_models_to_disk()
+            print(f'Training time: {training_time:.1f}s ({games / training_time:.1f} games/s)')
             print('main loss:', np.mean(agent.main_module.train_loss_history), 'declare loss:', np.mean(agent.declare_module.train_loss_history), 'kitty loss:', np.mean(agent.kitty_module.train_loss_history), 'chaodi loss:', np.mean(agent.chaodi_module.train_loss_history))
             if agent.sac:
                 print("Current alpha:", agent.main_module.log_alpha.exp().cpu().item())
@@ -261,7 +268,9 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
                 "iterations": iterations,
                 "win_counts": win_counts[0] / sum(win_counts),
                 "level_counts": level_counts[0] / sum(level_counts),
-                "avg_points": [np.mean(opposition_points[0]), np.mean(opposition_points[1])]
+                "avg_points": [np.mean(opposition_points[0]), np.mean(opposition_points[1])],
+                "training_time": training_time,
+                "games_per_sec": games / training_time,
             })
             with open(f'{model_folder}/stats.pkl', mode='w+b') as f:
                 pickle.dump(stats, f)
@@ -307,5 +316,6 @@ if __name__ == '__main__':
     parser.add_argument('--combo-alternation', action='store_true')
     parser.add_argument('--actor-processes', type=int, default=6)
     parser.add_argument('--eval-processes', type=int, default=7)
+    parser.add_argument('--model-architecture', type=str, default='mlp', choices=['mlp', 'transformer'])
     args = parser.parse_args()
-    train(args.agent_type, args.games, args.model_folder, args.eval_only, args.eval_size, args.compare, args.discount, args.decay_factor, not args.disable_chaodi, args.enable_combos, args.verbose, args.random_seed, args.single_process, args.epsilon, args.tau, args.kitty_agent, args.eval_agent, args.learn_from_eval, args.reuse_times, args.oracle_duration, args.max_games, args.combo_penalty, not args.static_encoding, args.combo_alternation, args.actor_processes, args.eval_processes)
+    train(args.agent_type, args.games, args.model_folder, args.eval_only, args.eval_size, args.compare, args.discount, args.decay_factor, not args.disable_chaodi, args.enable_combos, args.verbose, args.random_seed, args.single_process, args.epsilon, args.tau, args.kitty_agent, args.eval_agent, args.learn_from_eval, args.reuse_times, args.oracle_duration, args.max_games, args.combo_penalty, not args.static_encoding, args.combo_alternation, args.actor_processes, args.eval_processes, args.model_architecture)
