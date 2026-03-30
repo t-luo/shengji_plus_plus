@@ -3,6 +3,8 @@ import sys
 import random
 
 sys.path.append('.')
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
 from env.utils import CardSuit, TrumpSuit
 from env.CardSet import CardSet, MoveType
 

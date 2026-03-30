@@ -10,7 +10,9 @@ sys.path.append('.')
 from agents.RLAgents import ChaodiAgent, DeclareAgent, KittyAgent, MainAgent
 from networks.Models import ChaodiModel, DeclarationModel, KittyModel, MainModel
 from Simulation import Simulation
-from agents.Agent import RandomAgent, SJAgent, StrategicAgent
+from agents.Agent import SJAgent
+from agents.RandomAgent import RandomAgent
+from agents.StrategicAgent import StrategicAgent
 from env.Actions import DeclareAction, DontDeclareAction, PlaceKittyAction
 from env.utils import AbsolutePosition, Declaration, TrumpSuit
 from env.CardSet import CardSet
@@ -65,23 +67,27 @@ class TestGame(unittest.TestCase):
 
     def test_random_game_simulation(self):
         random.seed(101)
-        sim = Simulation(RandomAgent('Main'), RandomAgent('Declare'), RandomAgent('Kitty'), RandomAgent('Chaodi'))
+        sim = Simulation(player1=RandomAgent('random'), enable_chaodi=True)
         logging.getLogger().setLevel(logging.DEBUG)
-        
+
         while sim.step()[0]: pass
         print("Game summary:")
         print(sim.game_engine.print_status())
 
     def test_rl_agents(self):
+        from agents.DMCAgent import DMCAgent
         declare_model = DeclarationModel().to(self.device)
         kitty_model = KittyModel().to(self.device)
         chaodi_model = ChaodiModel().to(self.device)
         main_model = MainModel().to(self.device)
+        agent = DMCAgent('test', use_oracle=False)
+        agent.declare_module.load_model(declare_model)
+        agent.kitty_module.load_model(kitty_model)
+        agent.chaodi_module.load_model(chaodi_model)
+        agent.main_module.load_model(main_model)
         sim = Simulation(
-            main_agent=MainAgent('Main', main_model),
-            declare_agent=DeclareAgent('Declare', declare_model),
-            kitty_agent=KittyAgent('Kitty', kitty_model),
-            chaodi_agent=ChaodiAgent('Chaodi', chaodi_model)
+            player1=agent,
+            enable_chaodi=True,
         )
 
         logging.getLogger().setLevel(logging.DEBUG)

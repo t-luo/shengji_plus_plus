@@ -26,6 +26,45 @@ class StageModule:
     def learn_from_samples(self, samples: List[Tuple[Observation, Action, float]]):
         raise NotImplementedError()
 
+
+class DeepAgent(StageModule):
+    """Base class for stage-level RL agents wrapping a single neural network."""
+
+    def __init__(self, name: str, model: nn.Module, batch_size: int, tau: float = 0.995,
+                 use_oracle: bool = False) -> None:
+        import pickle
+        self.name = name
+        self.model = model
+        self.eval_model = pickle.loads(pickle.dumps(model)).to(next(model.parameters()).device)
+        self.eval_model.eval()
+        self.optimizer = torch.optim.RMSprop(model.parameters(), lr=0.0001, alpha=0.99, eps=1e-5)
+        self.tau = tau
+        self.batch_size = batch_size
+        self.use_oracle = use_oracle
+        self.loss_fn = nn.MSELoss()
+        self.train_loss_history: List[float] = []
+
+    def load_model(self, model: nn.Module):
+        self.model = model
+        self.eval_model = model
+
+    def prepare_batch_inputs(self, samples):
+        raise NotImplementedError()
+
+    def learn_from_samples(self, samples: List[Tuple[Observation, Action, float]]):
+        splits = int(len(samples) / self.batch_size)
+        for subsamples in np.array_split(np.array(samples, dtype=object), max(1, splits), axis=0):
+            *args, rewards = self.prepare_batch_inputs(subsamples)
+            pred = self.model(*args)
+            loss = self.loss_fn(pred, rewards)
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), 80)
+            self.optimizer.step()
+            self.train_loss_history.append(loss.detach().item())
+        for param, target_param in zip(self.model.parameters(), self.eval_model.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
 class SJAgent:
     def __init__(self, name: str) -> None:
         self.name = name
