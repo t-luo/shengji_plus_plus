@@ -65,10 +65,17 @@ def sampler(idx: int, player: SJAgent, discount, decay_factor, global_main_queue
                 same_deck_count = 0
                 train_sim.reset(reuse_old_deck=False)
         train_sim.epsilon = max(epsilon, train_sim.epsilon / decay_factor)
-        global_main_queue.put((local_main, t_sim_total / 10, t_infer_total / 10))
-        global_declare_queue.put(local_declare)
-        global_chaodi_queue.put(local_chaodi)
-        global_kitty_queue.put(local_kitty)
+
+        # Pre-tensorize in the actor process so the main process only does GPU work
+        main_tensors = player.main_module.prepare_batch_inputs(local_main) if local_main else None
+        declare_tensors = player.declare_module.prepare_batch_inputs(local_declare) if local_declare else None
+        kitty_tensors = player.kitty_module.prepare_batch_inputs(local_kitty) if local_kitty else None
+        chaodi_tensors = player.chaodi_module.prepare_batch_inputs(local_chaodi) if local_chaodi else None
+
+        global_main_queue.put((main_tensors, t_sim_total / 10, t_infer_total / 10))
+        global_declare_queue.put(declare_tensors)
+        global_chaodi_queue.put(chaodi_tensors)
+        global_kitty_queue.put(kitty_tensors)
 
 def evaluator(idx: int, player1: SJAgent, player2: SJAgent, enable_chaodi: bool, enable_combos: bool, eval_size: int, eval_results_queue: Queue, verbose=False, learn_from_eval=False, log_file=''):
     logging.getLogger().setLevel(logging.ERROR)
@@ -225,10 +232,10 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
                 avg_sim_times.append(avg_sim)
                 avg_infer_times.append(avg_infer)
                 tl = time.monotonic()
-                agent.learn_from_samples(declare_batch, Stage.declare_stage)
-                agent.learn_from_samples(kitty_batch, Stage.kitty_stage)
-                agent.learn_from_samples(chaodi_batch, Stage.chaodi_stage)
-                agent.learn_from_samples(main_batch, Stage.main_stage)
+                agent.declare_module.learn_from_tensors(declare_batch)
+                agent.kitty_module.learn_from_tensors(kitty_batch)
+                agent.chaodi_module.learn_from_tensors(chaodi_batch)
+                agent.main_module.learn_from_tensors(main_batch)
                 t_learn += time.monotonic() - tl
             training_time = time.monotonic() - t0
             agent.save_models_to_disk()

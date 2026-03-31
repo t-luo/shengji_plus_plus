@@ -4,6 +4,7 @@ import logging
 import pickle
 import random
 import sys
+import time as _time
 from typing import Deque, List, Tuple
 import numpy as np
 import os
@@ -29,7 +30,7 @@ class DMCModule(StageModule):
         self.optimizer: torch.optim.Optimizer = None
         self.dynamic_encoding = dynamic_encoding
         self._last_inference_ms: float = 0.0
-    
+
     # Use this function to load a pretrained model
     def load_model(self, model: nn.Module):
         self._model = model
@@ -38,16 +39,21 @@ class DMCModule(StageModule):
         self._eval_model.eval().share_memory()
         self.optimizer = torch.optim.RMSprop(model.parameters(), lr=0.0001, alpha=0.99, eps=1e-5)
 
-    # Helper function to prepare `Observation` and `Action` objects into tensors
-    # Returns a tensor: (batched observation-action pairs, batched rewards)
+    # Helper function to prepare `Observation` and `Action` objects into CPU tensors.
+    # Returns a tuple of CPU tensors: (*args, rewards)
     def prepare_batch_inputs(self, samples: List[Tuple[Observation, Action, float]]):
         raise NotImplementedError
 
-    # Training function
+    # Training function from raw samples (used in tests / single-process fallback)
     def learn_from_samples(self, samples: List[Tuple[Observation, Action, float]]):
+        if not samples:
+            return
+        device = next(self._model.parameters()).device
         splits = int(len(samples) / self.batch_size)
         for subsamples in np.array_split(np.array(samples, dtype=object), max(1, splits), axis=0):
             *args, rewards = self.prepare_batch_inputs(subsamples)
+            args = [a.to(device) for a in args]
+            rewards = rewards.to(device)
             pred = self._model(*args)
             loss = self.loss_fn(pred, rewards)
             self.optimizer.zero_grad()
@@ -66,15 +72,48 @@ class DMCModule(StageModule):
         for param, target_param in zip(self._model.parameters(), self._eval_model.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
+    # Training function from pre-built CPU tensors.
+    # Actors call prepare_batch_inputs and put tensors on the queue;
+    # the main process calls this to do GPU forward/backward without any Python loops.
+    def learn_from_tensors(self, tensors):
+        if tensors is None:
+            return
+        *args, rewards = tensors
+        device = next(self._model.parameters()).device
+        args = [a.to(device) for a in args]
+        rewards = rewards.to(device)
+        n = rewards.shape[0]
+        indices = torch.randperm(n)
+        for idx_chunk in torch.chunk(indices, max(1, n // self.batch_size)):
+            batch_args = [a[idx_chunk] for a in args]
+            batch_rewards = rewards[idx_chunk]
+            pred = self._model(*batch_args)
+            loss = self.loss_fn(pred, batch_rewards)
+            self.optimizer.zero_grad()
+            loss.backward()
+            if torch.isnan(loss):
+                def init_weights(m):
+                    if isinstance(m, nn.Linear):
+                        nn.init.xavier_uniform_(m.weight.data)
+                self._model.apply(init_weights)
+                print(f"Model {self} encountered nan, reset weights to random.")
+            else:
+                nn.utils.clip_grad_norm_(self._model.parameters(), 80)
+                self.optimizer.step()
+                self.train_loss_history.append(loss.detach().item())
+
+        for param, target_param in zip(self._model.parameters(), self._eval_model.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
     def _eval_in_chunks(self, tensors: list, chunk_size: int = 32) -> list:
         """Evaluate actions in chunks to bound activation memory per forward pass."""
-        import time as _time
         t0 = _time.monotonic()
         n = tensors[0].shape[0]
+        device = next(self._eval_model.parameters()).device
         results = []
         with torch.no_grad():
             for start in range(0, n, chunk_size):
-                chunk = [t[start:start + chunk_size] for t in tensors]
+                chunk = [t[start:start + chunk_size].to(device) for t in tensors]
                 results.append(self._eval_model(*chunk).cpu())
         self._last_inference_ms = (_time.monotonic() - t0) * 1000
         return torch.cat(results, dim=0).squeeze(1).tolist()
@@ -113,8 +152,7 @@ class DeclareModule(DMCModule):
             ])
             x_batch[i] = torch.cat([state_tensor, ac.tensor])
             gt_rewards[i] = rw
-        device = next(self._model.parameters()).device
-        return x_batch.to(device), gt_rewards.to(device)
+        return x_batch, gt_rewards  # CPU tensors
 
 
 class KittyModule(DMCModule):
@@ -138,8 +176,7 @@ class KittyModule(DMCModule):
             else:
                 action_batch[i] = ac.tensor
             gt_rewards[i] = rw
-        device = next(self._model.parameters()).device
-        return state_batch.to(device), action_batch.to(device), gt_rewards.to(device)
+        return state_batch, action_batch, gt_rewards  # CPU tensors
 
 
 class ChaodiModule(DMCModule):
@@ -157,8 +194,7 @@ class ChaodiModule(DMCModule):
             ])
             x_batch[i] = torch.cat([state_tensor, ac.tensor])
             gt_rewards[i] = rw
-        device = 'cuda' if torch.cuda.is_available() else 'cpu' # next(self._model.parameters()).device
-        return x_batch.to(device), gt_rewards.to(device)
+        return x_batch, gt_rewards  # CPU tensors
 
 
 class MainModule(DMCModule):
@@ -192,7 +228,7 @@ class MainModule(DMCModule):
                     next_action_entropy[i] = next_entropy
             else:
                 next_obs, current_entropy, next_entropy = None, None, None
-            
+
             state_tensor = torch.cat([
                 obs.dynamic_hand_tensor if self.dynamic_encoding else obs.hand.tensor, # (108,),
                 obs.dealer_position_tensor, # (4,)
@@ -218,8 +254,7 @@ class MainModule(DMCModule):
                 x_batch[i] = torch.cat([state_tensor, ac.tensor])
             history_batch[i] = historical_moves
             gt_rewards[i] = rw
-        device = next(self._model.parameters()).device
-        return x_batch.to(device), history_batch.to(device), current_action_entropy.to(device), next_action_entropy.to(device), gt_rewards.to(device)
+        return x_batch, history_batch, current_action_entropy, next_action_entropy, gt_rewards  # CPU tensors
 
     def act(self, obs: Observation, epsilon=None, training=True):
         x_batch, history_batch, *_ = self.prepare_batch_inputs([(obs, a, 0, None) for a in obs.actions])
@@ -239,11 +274,18 @@ class MainModule(DMCModule):
                 return obs.actions[optimal_index], action_distribution[optimal_index], entropy
         else:
             return obs.actions[optimal_index], action_distribution[optimal_index], entropy
-    
+
     def learn_from_samples(self, samples: List[Tuple[Observation, Action, float, Tuple[Observation, float, float]]]):
+        if not samples:
+            return
+        device = next(self._model.parameters()).device
         splits = int(len(samples) / self.batch_size)
         for subsamples in np.array_split(np.array(samples, dtype=object), max(1, splits), axis=0):
             *args, current_action_entropy, next_action_entropy, rewards = self.prepare_batch_inputs(subsamples)
+            args = [a.to(device) for a in args]
+            current_action_entropy = current_action_entropy.to(device)
+            next_action_entropy = next_action_entropy.to(device)
+            rewards = rewards.to(device)
             pred = self._model(*args)
             loss = self.loss_fn(pred, rewards + torch.exp(self.log_alpha) * next_action_entropy.unsqueeze(1))
             self.optimizer.zero_grad()
@@ -258,10 +300,48 @@ class MainModule(DMCModule):
                 nn.utils.clip_grad_norm_(self._model.parameters(), 80)
                 self.optimizer.step()
                 self.train_loss_history.append(loss.detach().item())
-            
+
             # Update alpha
             if self.sac:
                 alpha_loss = self.log_alpha.exp() * torch.mean(current_action_entropy) + self.log_alpha.exp() * 10
+                self.alpha_optimizer.zero_grad()
+                alpha_loss.backward()
+                self.alpha_optimizer.step()
+
+        for param, target_param in zip(self._model.parameters(), self._eval_model.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+    def learn_from_tensors(self, tensors):
+        """Train from pre-built CPU tensors (x, history, cur_entropy, next_entropy, rewards)."""
+        if tensors is None:
+            return
+        x_batch, history_batch, current_action_entropy, next_action_entropy, rewards = tensors
+        device = next(self._model.parameters()).device
+        x_batch = x_batch.to(device)
+        history_batch = history_batch.to(device)
+        current_action_entropy = current_action_entropy.to(device)
+        next_action_entropy = next_action_entropy.to(device)
+        rewards = rewards.to(device)
+        n = rewards.shape[0]
+        indices = torch.randperm(n)
+        for idx_chunk in torch.chunk(indices, max(1, n // self.batch_size)):
+            pred = self._model(x_batch[idx_chunk], history_batch[idx_chunk])
+            loss = self.loss_fn(pred, rewards[idx_chunk] + torch.exp(self.log_alpha) * next_action_entropy[idx_chunk].unsqueeze(1))
+            self.optimizer.zero_grad()
+            loss.backward()
+            if torch.isnan(loss):
+                def init_weights(m):
+                    if isinstance(m, nn.Linear):
+                        nn.init.xavier_uniform_(m.weight.data)
+                self._model.apply(init_weights)
+                print(f"Model {self} encountered nan, reset weights to random.")
+            else:
+                nn.utils.clip_grad_norm_(self._model.parameters(), 80)
+                self.optimizer.step()
+                self.train_loss_history.append(loss.detach().item())
+
+            if self.sac:
+                alpha_loss = self.log_alpha.exp() * torch.mean(current_action_entropy[idx_chunk]) + self.log_alpha.exp() * 10
                 self.alpha_optimizer.zero_grad()
                 alpha_loss.backward()
                 self.alpha_optimizer.step()
@@ -280,7 +360,7 @@ class DMCAgent(SJAgent):
         self.main_module: MainModule = MainModule(batch_size=64, use_oracle=use_oracle, dynamic_encoding=dynamic_encoding, sac=sac)
         self.dynamic_encoding = dynamic_encoding
         self.sac = sac
-    
+
     def optimizer_states(self):
         return {
             'declare_optim_state': self.declare_module.optimizer.state_dict(),
@@ -359,7 +439,7 @@ class DMCAgent(SJAgent):
         if self.chaodi_module._model is not None:
             torch.save(self.chaodi_module._model.state_dict(), self.name + '/chaodi.pt')
         torch.save(self.main_module._model.state_dict(), self.name + '/main.pt')
-    
+
     def clear_loss_histories(self):
         self.declare_module.train_loss_history.clear()
         self.kitty_module.train_loss_history.clear()
