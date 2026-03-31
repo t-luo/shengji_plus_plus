@@ -385,7 +385,7 @@ class DMCAgent(SJAgent):
         loaded_models = True
         declare_model: nn.Module = train_models.DeclarationModel().cuda()
         if os.path.exists(f'{self.name}/declare.pt'):
-            declare_model.load_state_dict(torch.load(f'{self.name}/declare.pt', map_location='cuda'), strict=False)
+            declare_model.load_state_dict(torch.load(f'{self.name}/declare.pt', map_location='cuda', weights_only=True), strict=False)
             print("Using loaded model for declaration")
         else:
             loaded_models = False
@@ -393,7 +393,7 @@ class DMCAgent(SJAgent):
 
         kitty_model: nn.Module = train_models.KittyModel().cuda()
         if os.path.exists(f'{self.name}/kitty.pt'):
-            kitty_model.load_state_dict(torch.load(f'{self.name}/kitty.pt', map_location='cuda'), strict=False)
+            kitty_model.load_state_dict(torch.load(f'{self.name}/kitty.pt', map_location='cuda', weights_only=True), strict=False)
             print("Using loaded model for kitty")
         else:
             loaded_models = False
@@ -401,7 +401,7 @@ class DMCAgent(SJAgent):
 
         chaodi_model: nn.Module = train_models.ChaodiModel().cuda()
         if os.path.exists(f'{self.name}/chaodi.pt'):
-            chaodi_model.load_state_dict(torch.load(f'{self.name}/chaodi.pt', map_location='cuda'), strict=False)
+            chaodi_model.load_state_dict(torch.load(f'{self.name}/chaodi.pt', map_location='cuda', weights_only=True), strict=False)
             print("Using loaded model for chaodi")
         else:
             loaded_models = False
@@ -421,7 +421,7 @@ class DMCAgent(SJAgent):
             loaded_models = False
         main_model: nn.Module = train_models.MainModel(use_oracle=self.main_module.use_oracle).cuda()
         if os.path.exists(f'{self.name}/main.pt'):
-            main_model.load_state_dict(torch.load(f'{self.name}/main.pt', map_location='cuda'), strict=False)
+            main_model.load_state_dict(torch.load(f'{self.name}/main.pt', map_location='cuda', weights_only=True), strict=False)
             print("Using loaded model for main game")
         else:
             loaded_models = False
