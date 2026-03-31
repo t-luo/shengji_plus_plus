@@ -44,14 +44,19 @@ def sampler(idx: int, player: SJAgent, discount, decay_factor, global_main_queue
     while True:
         local_main, local_declare, local_kitty, local_chaodi = [], [], [], []
         same_deck_count = 0
+        t_sim_total = 0.0
+        t_infer_total = 0.0
         for i in range(10):
+            t0 = time.monotonic()
             with torch.no_grad():
                 while train_sim.step()[0]: pass
-                local_main.extend(train_sim.main_history)
-                local_declare.extend(train_sim.declaration_history)
-                local_chaodi.extend(train_sim.chaodi_history)
-                local_kitty.extend(train_sim.kitty_history)
-            
+            t_sim_total += time.monotonic() - t0
+            t_infer_total += train_sim.total_inference_ms / 1000
+            local_main.extend(train_sim.main_history)
+            local_declare.extend(train_sim.declaration_history)
+            local_chaodi.extend(train_sim.chaodi_history)
+            local_kitty.extend(train_sim.kitty_history)
+
             # Get new deck every `reuse_times` times
             if same_deck_count < reuse_times:
                 same_deck_count += 1
@@ -59,10 +64,8 @@ def sampler(idx: int, player: SJAgent, discount, decay_factor, global_main_queue
             else:
                 same_deck_count = 0
                 train_sim.reset(reuse_old_deck=False)
-            # with open(log_file, 'w') as f:
-            #     f.write('')
         train_sim.epsilon = max(epsilon, train_sim.epsilon / decay_factor)
-        global_main_queue.put(local_main)
+        global_main_queue.put((local_main, t_sim_total / 10, t_infer_total / 10))
         global_declare_queue.put(local_declare)
         global_chaodi_queue.put(local_chaodi)
         global_kitty_queue.put(local_kitty)
@@ -208,18 +211,30 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
         if not eval_only:
             print(f"Training iterations {iterations}-{iterations + games}...")
             t0 = time.monotonic()
+            t_queue = 0.0
+            t_learn = 0.0
+            avg_sim_times = []
+            avg_infer_times = []
             for _ in tqdm.tqdm(range(0, games, 10)):
+                tq = time.monotonic()
                 declare_batch = global_declare_queue.get()
                 kitty_batch = global_kitty_queue.get()
-                main_batch = global_main_queue.get()
+                main_batch, avg_sim, avg_infer = global_main_queue.get()
                 chaodi_batch = global_chaodi_queue.get()
+                t_queue += time.monotonic() - tq
+                avg_sim_times.append(avg_sim)
+                avg_infer_times.append(avg_infer)
+                tl = time.monotonic()
                 agent.learn_from_samples(declare_batch, Stage.declare_stage)
                 agent.learn_from_samples(kitty_batch, Stage.kitty_stage)
                 agent.learn_from_samples(chaodi_batch, Stage.chaodi_stage)
                 agent.learn_from_samples(main_batch, Stage.main_stage)
+                t_learn += time.monotonic() - tl
             training_time = time.monotonic() - t0
             agent.save_models_to_disk()
             print(f'Training time: {training_time:.1f}s ({games / training_time:.1f} games/s)')
+            print(f'  Queue wait: {t_queue:.1f}s ({100*t_queue/training_time:.0f}%)  Learn: {t_learn:.1f}s ({100*t_learn/training_time:.0f}%)')
+            print(f'  Avg sim/game: {np.mean(avg_sim_times):.2f}s  Avg inference/game: {np.mean(avg_infer_times):.2f}s ({100*np.mean(avg_infer_times)/np.mean(avg_sim_times):.0f}% of sim)')
             print('main loss:', np.mean(agent.main_module.train_loss_history), 'declare loss:', np.mean(agent.declare_module.train_loss_history), 'kitty loss:', np.mean(agent.kitty_module.train_loss_history), 'chaodi loss:', np.mean(agent.chaodi_module.train_loss_history))
             if agent.sac:
                 print("Current alpha:", agent.main_module.log_alpha.exp().cpu().item())
@@ -281,6 +296,10 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
                 "avg_points": [np.mean(opposition_points[0]), np.mean(opposition_points[1])],
                 "training_time": training_time,
                 "games_per_sec": games / training_time,
+                "queue_wait": t_queue,
+                "learn_time": t_learn,
+                "avg_sim_per_game": float(np.mean(avg_sim_times)),
+                "avg_infer_per_game": float(np.mean(avg_infer_times)),
             })
             with open(f'{model_folder}/stats.pkl', mode='w+b') as f:
                 pickle.dump(stats, f)

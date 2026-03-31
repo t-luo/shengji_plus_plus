@@ -40,6 +40,7 @@ class Simulation:
         self.player2 = player2
         self.epsilon = epsilon
         self.combo_penalty = combo_penalty
+        self.total_inference_ms: float = 0.0  # cumulative inference time across all steps
 
         # (state, action, reward) tuples for each player during the main stage of the game
         self._main_history_per_player: Dict[AbsolutePosition, List[Tuple[Observation, Action, float]]] = {
@@ -120,6 +121,7 @@ class Simulation:
                     action, max_prob, entropy = self.player1.act(observation, epsilon=not self.eval_mode and self.epsilon, training=not self.eval_mode)
                     if self.eval_mode:
                         self.inference_times.append(datetime.now().timestamp() - start)
+                    self.total_inference_ms += getattr(self.player1.main_module, '_last_inference_ms', 0.0)
             
             last_stage = self.game_engine.stage
             last_player = self.current_player
@@ -281,6 +283,7 @@ class Simulation:
         self.declaration_history.clear()
         self.chaodi_history.clear()
         self.kitty_history.clear()
+        self.total_inference_ms = 0.0
 
         # If reuse_old_deck, then re-play the game using the same hands
         if not self.game_engine.is_warmup_game and reuse_old_deck:

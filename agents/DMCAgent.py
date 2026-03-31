@@ -28,6 +28,7 @@ class DMCModule(StageModule):
         self.train_loss_history: List[float] = []
         self.optimizer: torch.optim.Optimizer = None
         self.dynamic_encoding = dynamic_encoding
+        self._last_inference_ms: float = 0.0
     
     # Use this function to load a pretrained model
     def load_model(self, model: nn.Module):
@@ -67,12 +68,15 @@ class DMCModule(StageModule):
 
     def _eval_in_chunks(self, tensors: list, chunk_size: int = 32) -> list:
         """Evaluate actions in chunks to bound activation memory per forward pass."""
+        import time as _time
+        t0 = _time.monotonic()
         n = tensors[0].shape[0]
         results = []
         with torch.no_grad():
             for start in range(0, n, chunk_size):
                 chunk = [t[start:start + chunk_size] for t in tensors]
                 results.append(self._eval_model(*chunk).cpu())
+        self._last_inference_ms = (_time.monotonic() - t0) * 1000
         return torch.cat(results, dim=0).squeeze(1).tolist()
 
     def act(self, obs: Observation, epsilon=None, training=True):
