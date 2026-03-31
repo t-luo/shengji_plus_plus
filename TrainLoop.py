@@ -248,6 +248,7 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
             win_counts = [0, 0] # Defenders, opponents
             level_counts = [0, 0]
             opposition_points = [[], []]
+            torch.cuda.empty_cache()
             eval_queue = ctx.Queue()
             eval_actors = []
             for i in range(min(eval_size, eval_process_count)):
