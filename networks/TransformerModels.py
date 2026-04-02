@@ -137,7 +137,7 @@ class ChaodiModel(nn.Module):
 
 # ── Transformer backbone ──────────────────────────────────────────────────────
 
-D_MODEL = 64
+D_MODEL = 128
 
 
 def _make_sinusoidal(max_len: int, d_model: int) -> torch.Tensor:
@@ -162,8 +162,8 @@ class _TransformerBase(nn.Module):
     All other tokens are always attended to.
     """
 
-    def __init__(self, has_action: bool, d_model: int = D_MODEL, nhead: int = 4,
-                 num_layers: int = 2, dim_feedforward: int = 256, dropout: float = 0.1):
+    def __init__(self, has_action: bool, d_model: int = D_MODEL, nhead: int = 8,
+                 num_layers: int = 4, dim_feedforward: int = 512, dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
         self.has_action = has_action
@@ -326,8 +326,8 @@ class MainModel(_TransformerBase):
     use_oracle is accepted for API compatibility but ignored (oracle hurts generalization).
     """
 
-    def __init__(self, use_oracle: bool = False, d_model: int = D_MODEL, nhead: int = 4,
-                 num_layers: int = 2, dim_feedforward: int = 256, dropout: float = 0.1):
+    def __init__(self, use_oracle: bool = False, d_model: int = D_MODEL, nhead: int = 8,
+                 num_layers: int = 4, dim_feedforward: int = 512, dropout: float = 0.1):
         super().__init__(
             has_action=True,
             d_model=d_model,
@@ -348,8 +348,8 @@ class ValueModel(_TransformerBase):
     Receives 764-dim x (state without dominates_all and action).
     """
 
-    def __init__(self, d_model: int = D_MODEL, nhead: int = 4,
-                 num_layers: int = 2, dim_feedforward: int = 256, dropout: float = 0.1):
+    def __init__(self, d_model: int = D_MODEL, nhead: int = 8,
+                 num_layers: int = 4, dim_feedforward: int = 512, dropout: float = 0.1):
         super().__init__(
             has_action=False,
             d_model=d_model,
