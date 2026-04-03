@@ -27,7 +27,7 @@ global_kitty_queue = ctx.Queue(maxsize=25)
 actor_processes = []
 
 # Parallelized data sampling
-def sampler(idx: int, player: SJAgent, discount, decay_factor, global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, enable_chaodi: bool, enable_combos: bool, epsilon=0.02, reuse_times=0, oracle_duration=0, game_count=0, log_file='', combo_penalty=0.1, combo_alternation=False):
+def sampler(idx: int, player: SJAgent, discount, decay_factor, global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, enable_chaodi: bool, enable_combos: bool, epsilon=0.02, reuse_times=0, oracle_duration=0, game_count=0, log_file='', combo_penalty=0.1, combo_alternation=False, epsilon_start=0.5):
     logging.getLogger().setLevel(logging.ERROR)
     # logging.basicConfig(format="%(process)d %(message)s", filename=log_file, encoding='utf-8', level=logging.DEBUG)
     train_sim = Simulation(
@@ -36,7 +36,7 @@ def sampler(idx: int, player: SJAgent, discount, decay_factor, global_main_queue
         enable_chaodi=enable_chaodi,
         enable_combos=enable_combos,
         discount=discount,
-        epsilon=0.02,
+        epsilon=epsilon_start,
         oracle_duration=oracle_duration,
         game_count=game_count,
         combo_penalty=combo_penalty
@@ -113,7 +113,7 @@ def evaluator(idx: int, player1: SJAgent, player2: SJAgent, enable_chaodi: bool,
     
 
 
-def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_size: int, compare: str = None, discount=0.99, decay_factor=1.2, chaodi=True, combos=False, verbose=False, random_seed=1, single_process=False, epsilon=0.01, tau=0.995, kitty_agent='fc', eval_agent_type='random', learn_from_eval=False, reuse_times=0, oracle_duration=0, max_games=500000, combo_penalty=0.1, dynamic_encoding=True, combo_alternation=False, actor_process_count=6, eval_process_count=7, model_architecture='mlp'):
+def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_size: int, compare: str = None, discount=0.99, decay_factor=1.2, chaodi=True, combos=False, verbose=False, random_seed=1, single_process=False, epsilon=0.01, tau=0.995, kitty_agent='fc', eval_agent_type='random', learn_from_eval=False, reuse_times=0, oracle_duration=0, max_games=500000, combo_penalty=0.1, dynamic_encoding=True, combo_alternation=False, actor_process_count=6, eval_process_count=7, model_architecture='mlp', eval_agents=None, epsilon_start=0.5):
     os.makedirs(model_folder, exist_ok=True)
     torch.manual_seed(0)
     random.seed(random_seed)
@@ -148,40 +148,43 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
         with open(model_folder + '/stats.pkl', 'rb') as f:
             stats = pickle.load(f)
 
-    eval_agent: SJAgent
-
-    if compare:
-        try:
-            with open(f'{compare}/state.pkl', mode='rb') as f:
-                eval_state = pickle.load(f)
-        except:
-            raise FileNotFoundError("State file for comparison model not found")
-        _eval_models_path = f"{compare}/Models.py"
-        _eval_src = _eval_models_path if os.path.exists(_eval_models_path) else "networks/Models.py"
-        shutil.copyfile(_eval_src, "networks/EvalModels.py")
-        if "networks.EvalModels" in sys.modules:
-            del sys.modules["networks.EvalModels"]
-        eval_models = importlib.import_module("networks.EvalModels")
-
-        if eval_state.get('agent_type', 'dmc') in ('dqn', 'dqnsac', 'sac'):
-            eval_agent = DQNAgent(compare, sac=eval_state['agent_type'].endwith('sac'))
+    def _build_eval_agent(spec: str) -> tuple:
+        """Parse an eval agent spec and return (label, agent).
+        Spec format: 'random' | 'strategic' | 'interactive' | 'model:<folder>'
+        """
+        if spec == 'random':
+            return 'random', RandomAgent('random')
+        elif spec == 'strategic':
+            return 'strategic', StrategicAgent('strategic')
+        elif spec == 'interactive':
+            return 'interactive', InteractiveAgent('interactive')
+        elif spec.startswith('model:'):
+            folder = spec[len('model:'):]
+            try:
+                eval_state = torch.load(f'{folder}/state.pkl', map_location='cpu', weights_only=False)
+            except Exception:
+                eval_state = {}
+            _eval_src = f'{folder}/Models.py' if os.path.exists(f'{folder}/Models.py') else 'networks/Models.py'
+            shutil.copyfile(_eval_src, 'networks/EvalModels.py')
+            if 'networks.EvalModels' in sys.modules:
+                del sys.modules['networks.EvalModels']
+            eval_models = importlib.import_module('networks.EvalModels')
+            ea = DMCAgent(folder, use_oracle=eval_state.get('oracle_duration', 0) > 0,
+                          dynamic_encoding=eval_state.get('dynamic_encoding', True),
+                          sac=eval_state.get('agent_type', 'dmc').endswith('sac'))
+            ea.load_models_from_disk(eval_models)
+            return os.path.basename(folder), ea
         else:
-            eval_agent = DMCAgent(compare, use_oracle=eval_state['oracle_duration'] > 0, dynamic_encoding=eval_state.get('dynamic_encoding', True), sac=eval_state.get('agent_type', 'dmc').endswith('sac'))
-        
-        loaded_eval_model, eval_iterations = eval_agent.load_models_from_disk(eval_models)
-        if loaded_eval_model:
-            print(f"Using evaluation checkpoint at iteration {eval_iterations}")
-        
+            raise ValueError(f"Unknown eval agent spec: {spec!r}. Use 'random', 'strategic', or 'model:<folder>'")
+
+    # Build list of (label, agent) pairs to evaluate against
+    if eval_agents:
+        eval_agent_list = [_build_eval_agent(s) for s in eval_agents]
+    elif compare:
+        eval_agent_list = [_build_eval_agent(f'model:{compare}')]
     else:
-        if eval_agent_type == 'random':
-            eval_agent = RandomAgent('random')
-            print("Evaluating model performance using random agent...")
-        elif eval_agent_type == 'strategic':
-            eval_agent = StrategicAgent('strategic')
-            print("Evaluating model performance using strategic agent...")
-        else:
-            eval_agent = InteractiveAgent('interactive')
-            print("Evaluating model performance in interactive mode...")
+        eval_agent_list = [_build_eval_agent(eval_agent_type)]
+    print(f"Evaluating against: {[label for label, _ in eval_agent_list]}")
 
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -212,7 +215,7 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
     
     if not eval_only:
         for i in range(1 if single_process else actor_process_count):
-            actor = ctx.Process(target=sampler, args=(i, agent, discount, decay_factor ** (1 / games), global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, chaodi, combos, epsilon, reuse_times, oracle_duration // actor_process_count, iterations // actor_process_count, f"{model_folder}/debug{i}.log", combo_penalty, combo_alternation))
+            actor = ctx.Process(target=sampler, args=(i, agent, discount, decay_factor ** (1 / games), global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, chaodi, combos, epsilon, reuse_times, oracle_duration // actor_process_count, iterations // actor_process_count, f"{model_folder}/debug{i}.log", combo_penalty, combo_alternation, epsilon_start))
             actor.start()
             actor_processes.append(actor)
             
@@ -253,49 +256,56 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
                     print("value loss:", np.mean(agent.main_module.value_loss_history))
             agent.clear_loss_histories()
         
-        if single_process:
-            eval_sim = Simulation(
-                player1=agent,
-                player2=eval_agent,
-                enable_chaodi=chaodi,
-                enable_combos=combos,
-                eval=True
-            )
-            for _ in tqdm.tqdm(range(eval_size)):
-                with torch.no_grad():
-                    while eval_sim.step()[0]: pass
-                eval_sim.reset()
-            win_counts = eval_sim.win_counts
-            level_counts = eval_sim.level_counts
-            opposition_points = eval_sim.opposition_points
-            print(f"Average inference time: {np.mean(eval_sim.inference_times)}s")
-        else:
-            # eval_size = max(1, eval_size // eval_count * eval_count) # Must be multiple of eval_count
-            win_counts = [0, 0] # Defenders, opponents
-            level_counts = [0, 0]
-            opposition_points = [[], []]
-            torch.cuda.empty_cache()
-            eval_queue = ctx.Queue()
-            eval_actors = []
-            for i in range(min(eval_size, eval_process_count)):
-                actor = ctx.Process(target=evaluator, args=(i, agent, eval_agent, chaodi, combos, max(1, eval_size // eval_process_count), eval_queue, verbose, learn_from_eval, f"{model_folder}/eval{i}.log"))
-                actor.start()
-                eval_actors.append(actor)
-        
-            with tqdm.tqdm(total=eval_size) as progress_bar:
-                for i in range(eval_size):
-                    win_index, opponent_index, points, levels = eval_queue.get()
-                    win_counts[win_index] += 1
-                    level_counts[win_index] += levels
-                    opposition_points[opponent_index].append(points)
-                    progress_bar.update(1)
-                
-        
-            for a in eval_actors:
-                a.kill()
+        per_opponent_stats = {}
+        games_per_eval = max(1, eval_size // len(eval_agent_list))
 
-        print('Win counts:', win_counts, 'level counts:', level_counts)
-        print("Average opposition points:", np.mean(opposition_points[0]), np.mean(opposition_points[1]))
+        for opp_label, eval_agent in eval_agent_list:
+            if single_process:
+                eval_sim = Simulation(
+                    player1=agent,
+                    player2=eval_agent,
+                    enable_chaodi=chaodi,
+                    enable_combos=combos,
+                    eval=True
+                )
+                for _ in tqdm.tqdm(range(games_per_eval), desc=opp_label):
+                    with torch.no_grad():
+                        while eval_sim.step()[0]: pass
+                    eval_sim.reset()
+                win_counts = eval_sim.win_counts
+                level_counts = eval_sim.level_counts
+                opposition_points = eval_sim.opposition_points
+            else:
+                win_counts = [0, 0]
+                level_counts = [0, 0]
+                opposition_points = [[], []]
+                torch.cuda.empty_cache()
+                eval_queue = ctx.Queue()
+                eval_actors = []
+                procs = min(games_per_eval, eval_process_count)
+                for i in range(procs):
+                    actor = ctx.Process(target=evaluator, args=(i, agent, eval_agent, chaodi, combos, max(1, games_per_eval // procs), eval_queue, verbose, learn_from_eval, f"{model_folder}/eval{i}.log"))
+                    actor.start()
+                    eval_actors.append(actor)
+                with tqdm.tqdm(total=games_per_eval, desc=opp_label) as progress_bar:
+                    for i in range(games_per_eval):
+                        win_index, opponent_index, points, levels = eval_queue.get()
+                        win_counts[win_index] += 1
+                        level_counts[win_index] += levels
+                        opposition_points[opponent_index].append(points)
+                        progress_bar.update(1)
+                for a in eval_actors:
+                    a.kill()
+
+            per_opponent_stats[opp_label] = {
+                'win_counts': win_counts,
+                'level_counts': level_counts,
+                'avg_points': [float(np.mean(opposition_points[0])) if opposition_points[0] else 0.0,
+                               float(np.mean(opposition_points[1])) if opposition_points[1] else 0.0],
+            }
+            win_rate = win_counts[0] / sum(win_counts) if sum(win_counts) > 0 else 0
+            lvl_rate = level_counts[0] / sum(level_counts) if sum(level_counts) > 0 else 0
+            print(f'  vs {opp_label}: win={win_rate:.1%}  level={lvl_rate:.1%}  opp_pts={per_opponent_stats[opp_label]["avg_points"]}')
         
         iterations += games
 
@@ -303,11 +313,20 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
             agent.save_snapshot(iterations)
 
         if not eval_only:
+            # Aggregate across all opponents for backwards-compatible summary fields
+            all_win = [0, 0]
+            all_lvl = [0, 0]
+            all_pts = [[], []]
+            for s in per_opponent_stats.values():
+                all_win[0] += s['win_counts'][0]; all_win[1] += s['win_counts'][1]
+                all_lvl[0] += s['level_counts'][0]; all_lvl[1] += s['level_counts'][1]
+                all_pts[0].append(s['avg_points'][0]); all_pts[1].append(s['avg_points'][1])
             stats.append({
                 "iterations": iterations,
-                "win_counts": win_counts[0] / sum(win_counts),
-                "level_counts": level_counts[0] / sum(level_counts),
-                "avg_points": [np.mean(opposition_points[0]), np.mean(opposition_points[1])],
+                "win_counts": all_win[0] / sum(all_win) if sum(all_win) > 0 else 0,
+                "level_counts": all_lvl[0] / sum(all_lvl) if sum(all_lvl) > 0 else 0,
+                "avg_points": [float(np.mean(all_pts[0])), float(np.mean(all_pts[1]))],
+                "per_opponent": per_opponent_stats,
                 "training_time": training_time,
                 "games_per_sec": games / training_time,
                 "queue_wait": t_queue,
@@ -345,10 +364,12 @@ if __name__ == '__main__':
     parser.add_argument('--disable-chaodi', action='store_true')
     parser.add_argument('--enable-combos', action='store_true')
     parser.add_argument('--single-process', action='store_true')
-    parser.add_argument('--epsilon', type=float, default=0.01)
+    parser.add_argument('--epsilon', type=float, default=0.01, help='Epsilon floor (minimum exploration rate)')
+    parser.add_argument('--epsilon-start', type=float, default=0.5, help='Initial epsilon before decay')
     parser.add_argument('--tau', type=float, default=0.1)
     parser.add_argument('--kitty-agent', type=str, default='fc', choices=['fc', 'argmax', 'rnn', 'lstm'])
     parser.add_argument('--eval-agent', type=str, default='random', choices=['random', 'interactive', 'strategic'])
+    parser.add_argument('--eval-agents', type=str, nargs='*', default=None, help="List of eval agent specs: 'random', 'strategic', 'model:<folder>'")
     parser.add_argument('--learn-from-eval', action='store_true')
     parser.add_argument('--reuse-times', type=int, default=0)
     parser.add_argument('--oracle-duration', type=int, default=0)
@@ -360,4 +381,4 @@ if __name__ == '__main__':
     parser.add_argument('--eval-processes', type=int, default=7)
     parser.add_argument('--model-architecture', type=str, default='mlp', choices=['mlp', 'transformer'])
     args = parser.parse_args()
-    train(args.agent_type, args.games, args.model_folder, args.eval_only, args.eval_size, args.compare, args.discount, args.decay_factor, not args.disable_chaodi, args.enable_combos, args.verbose, args.random_seed, args.single_process, args.epsilon, args.tau, args.kitty_agent, args.eval_agent, args.learn_from_eval, args.reuse_times, args.oracle_duration, args.max_games, args.combo_penalty, not args.static_encoding, args.combo_alternation, args.actor_processes, args.eval_processes, args.model_architecture)
+    train(args.agent_type, args.games, args.model_folder, args.eval_only, args.eval_size, args.compare, args.discount, args.decay_factor, not args.disable_chaodi, args.enable_combos, args.verbose, args.random_seed, args.single_process, args.epsilon, args.tau, args.kitty_agent, args.eval_agent, args.learn_from_eval, args.reuse_times, args.oracle_duration, args.max_games, args.combo_penalty, not args.static_encoding, args.combo_alternation, args.actor_processes, args.eval_processes, args.model_architecture, args.eval_agents, args.epsilon_start)

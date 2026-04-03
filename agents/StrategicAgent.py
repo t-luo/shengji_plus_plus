@@ -115,13 +115,15 @@ class MainModule(StageModule):
                         optimal_actions.append(action)
                     else:
                         other_actions.append(action)
-                
-                if optimal_actions:
-                    return random.choice(optimal_actions), None, None
-                elif second_best_actions:
-                    return random.choice(second_best_actions), None, None
-                else:
-                    return other_actions[0], None, None
+
+            if optimal_actions:
+                return random.choice(optimal_actions), None, None
+            elif second_best_actions:
+                return random.choice(second_best_actions), None, None
+            elif other_actions:
+                return random.choice(other_actions), None, None
+            else:
+                return random.choice(obs.actions), None, None
                         
         else:
             current_round_points = 0
