@@ -408,9 +408,8 @@ class DMCAgent(SJAgent):
         self.chaodi_module.load_model(chaodi_model)
 
         try:
-            with open(f'{self.name}/state.pkl', mode='rb') as f:
-                state = pickle.load(f)
-                self.main_module.use_oracle = state['oracle_duration'] > 0
+            state = torch.load(f'{self.name}/state.pkl', map_location='cpu', weights_only=False)
+            self.main_module.use_oracle = state['oracle_duration'] > 0
             with open(f'{self.name}/stats.pkl', mode='rb') as f:
                 stats = pickle.load(f)
                 iterations = stats[-1]['iterations']

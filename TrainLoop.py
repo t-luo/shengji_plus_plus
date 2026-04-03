@@ -195,16 +195,20 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
             f.write(' '.join(sys.argv))
     
     # Load saved optimizer states
+    _state_path = f'{model_folder}/state.pkl'
     try:
-        with open(f'{model_folder}/state.pkl', mode='rb') as f:
-            state = pickle.load(f)
-            agent.load_optimizer_states(state)
-    except:
+        state = torch.load(_state_path, map_location='cpu', weights_only=False)
+        agent.load_optimizer_states(state)
+        print("Loaded optimizer states from checkpoint")
+    except FileNotFoundError:
         print("Starting new training session")
         if model_architecture == 'transformer':
             shutil.copyfile('networks/TransformerModels.py', f'{model_folder}/Models.py')
         else:
             shutil.copyfile('networks/Models.py', f'{model_folder}/Models.py')
+    except Exception as e:
+        print(f"WARNING: Failed to load optimizer states: {e}")
+        print("Model weights are loaded but optimizer state is reset — this may cause instability")
     
     if not eval_only:
         for i in range(1 if single_process else actor_process_count):
@@ -310,14 +314,13 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
             })
             with open(f'{model_folder}/stats.pkl', mode='w+b') as f:
                 pickle.dump(stats, f)
-            with open(f'{model_folder}/state.pkl', mode='w+b') as f:
-                pickle.dump({
+            torch.save({
                     'agent_type': agent_type,
                     'iterations': iterations,
                     **agent.optimizer_states(),
                     'oracle_duration': oracle_duration_input,
                     'dynamic_encoding': dynamic_encoding
-                }, f)
+                }, f'{model_folder}/state.pkl')
         else:
             break
     
