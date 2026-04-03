@@ -299,6 +299,9 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
         
         iterations += games
 
+        if not eval_only and iterations % 100000 < games:
+            agent.save_snapshot(iterations)
+
         if not eval_only:
             stats.append({
                 "iterations": iterations,

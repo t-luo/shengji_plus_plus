@@ -439,6 +439,18 @@ class DMCAgent(SJAgent):
             torch.save(self.chaodi_module._model.state_dict(), self.name + '/chaodi.pt')
         torch.save(self.main_module._model.state_dict(), self.name + '/main.pt')
 
+    def save_snapshot(self, iterations: int):
+        """Save a versioned snapshot of model weights to <name>/snapshots/<iterations>/."""
+        import os
+        snapshot_dir = f'{self.name}/snapshots/{iterations}'
+        os.makedirs(snapshot_dir, exist_ok=True)
+        torch.save(self.declare_module._model.state_dict(), f'{snapshot_dir}/declare.pt')
+        torch.save(self.kitty_module._model.state_dict(), f'{snapshot_dir}/kitty.pt')
+        if self.chaodi_module._model is not None:
+            torch.save(self.chaodi_module._model.state_dict(), f'{snapshot_dir}/chaodi.pt')
+        torch.save(self.main_module._model.state_dict(), f'{snapshot_dir}/main.pt')
+        print(f'Saved snapshot at iteration {iterations}')
+
     def clear_loss_histories(self):
         self.declare_module.train_loss_history.clear()
         self.kitty_module.train_loss_history.clear()
