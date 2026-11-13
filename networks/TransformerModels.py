@@ -29,6 +29,19 @@ history_batch layout: (B, 15, 436)
   112:220 right cards (108)
   220:328 opposite cards (108)
   328:436 left cards (108)
+
+Revision history (docs/improvement_plan.md):
+  - §4.5: TransformerEncoder now has a final LayerNorm (Pre-LN without one lets the residual
+    stream grow unnormalized with depth).
+  - §4.4: the leader one-hot is fed into each history trick's 4 player tokens instead of being
+    sliced off and discarded, so the model can tell who led/won past tricks.
+  - §4.6: history tokens for tricks that haven't happened yet (front-padding) are masked out of
+    attention, detected via an all-zero leader one-hot.
+  - §4.7: cardset/hand tokens go through a 2-layer MLP (Linear-GELU-Linear) instead of a single
+    Linear, so they can express non-linear features of a card count vector (e.g. "is a pair").
+  - §2/E2: the output head is now ~1.3M params (matching the LSTM baseline's Q-head) and reads
+    the raw state vector directly alongside the CLS token, instead of forcing every action
+    comparison through a 128-dim bottleneck.
 """
 
 import math
@@ -167,15 +180,32 @@ class _TransformerBase(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.has_action = has_action
+        # Raw x_batch width: MainModel includes dominates_all(1)+action(108), ValueModel doesn't.
+        self.raw_x_dim = 873 if has_action else 764
 
         # Shared card embedding: 54 slots × d_model
         self.card_embedding = nn.Embedding(54, d_model)
 
-        # Projection after weighted-sum card-set encoding
-        self.cardset_proj = nn.Linear(d_model, d_model)
+        # Nonlinear projection after weighted-sum card-set encoding. A single Linear here would
+        # make every cardset token a purely linear function of card counts, unable to express
+        # things like "is this a pair/tractor" (docs/improvement_plan.md §4.7).
+        self.cardset_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
 
-        # Per-token projection for hand card tokens
-        self.hand_proj = nn.Linear(d_model, d_model)
+        # Per-token nonlinear projection for hand card tokens
+        self.hand_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+        # Projects each history trick's leader one-hot (4,) into embedding space, added to every
+        # one of that trick's 4 player tokens so the model knows who led (§4.4) — previously
+        # discarded entirely, which also meant the model couldn't determine who won any trick.
+        self.hist_leader_proj = nn.Linear(4, d_model)
 
         # Scalar context: MainModel includes dominates_all(1), ValueModel does not
         scalar_dim = 117 if has_action else 116
@@ -188,7 +218,9 @@ class _TransformerBase(nn.Module):
         # Sinusoidal positional encoding for 60 history slots (15 tricks × 4 players)
         self.register_buffer('hist_pos_enc', _make_sinusoidal(60, d_model))
 
-        # Transformer encoder (Pre-LN for training stability)
+        # Transformer encoder (Pre-LN for training stability, with a final norm on the residual
+        # stream — norm_first=True normalizes each sublayer's input but never its output, so
+        # without this the un-normalized residual stream grows with depth; see §4.5).
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -197,26 +229,40 @@ class _TransformerBase(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers, enable_nested_tensor=False)
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers, norm=nn.LayerNorm(d_model), enable_nested_tensor=False)
 
-        # Output head
+        # Output head. Moved most of the network's capacity here (~1.3M params, matching the
+        # LSTM baseline's Q-head) and gave it direct access to the raw state alongside the CLS
+        # token, instead of forcing every comparison between actions through a 128-dim bottleneck
+        # that was 2 orders of magnitude smaller than the LSTM's head (docs/improvement_plan.md §2/E2).
         self.head = nn.Sequential(
-            nn.Linear(d_model, 64),
+            nn.Linear(d_model + self.raw_x_dim, 512),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1),
         )
 
-    def _enc_cardset(self, x: torch.Tensor) -> torch.Tensor:
+    def _enc_cardset(self, x: torch.Tensor, extra: torch.Tensor = None) -> torch.Tensor:
         """
         Encodes a (B, 108) dynamic card tensor to (B, d_model).
 
         Dynamic encoding: tensor[i]=1 iff count≥1, tensor[54+i]=1 iff count≥2.
         count[i] = x[i] + x[54+i] ∈ {0, 1, 2}.
         We take the count-weighted sum of card embeddings.
+
+        `extra`, if given, is a (B, 4) leader one-hot added into the embedding before the
+        nonlinearity (used only for history trick tokens — see _enc_history).
         """
         count = x[:, :54] + x[:, 54:]              # (B, 54)
         emb = count @ self.card_embedding.weight     # (B, d_model)
-        return self.cardset_proj(emb)
+        if extra is not None:
+            emb = emb + self.hist_leader_proj(extra)
+        return self.cardset_mlp(emb)
 
     def _enc_hand(self, x: torch.Tensor):
         """
@@ -229,28 +275,37 @@ class _TransformerBase(nn.Module):
         count = x[:, :54] + x[:, 54:]                          # (B, 54)
         # (B, 54, 1) * (1, 54, d_model) → (B, 54, d_model)
         tokens = count.unsqueeze(-1) * self.card_embedding.weight.unsqueeze(0)
-        tokens = self.hand_proj(tokens)
+        tokens = self.hand_mlp(tokens)
         pad_mask = (count == 0)                                 # True = absent
         return tokens, pad_mask
 
-    def _enc_history(self, history: torch.Tensor) -> torch.Tensor:
+    def _enc_history(self, history: torch.Tensor):
         """
         Encodes (B, 15, 436) history into (B, 60, d_model) trick tokens.
 
         Each trick row: [leader_pos(4), self(108), right(108), opp(108), left(108)].
         4 player tokens per trick × 15 tricks = 60 tokens total.
         Sinusoidal positional encoding is added to preserve trick order.
+
+        Returns:
+            tokens: (B, 60, d_model)
+            leader: (B, 15, 4) raw leader one-hot — also used by the caller to build the
+                    padding mask, since an all-zero leader row means that trick hasn't
+                    happened yet (front-padding; see Observation.historical_moves_*_tensor).
         """
         B = history.shape[0]
+        leader = history[:, :, :4]                               # (B, 15, 4)
         # Extract card tensors for all 4 players across all 15 tricks
-        cards = history[:, :, 4:].reshape(B * 15, 4, 108)       # (B*15, 4, 108)
+        cards = history[:, :, 4:].reshape(B * 15, 4, 108)        # (B*15, 4, 108)
+        # Same leader info is relevant to all 4 of a trick's player tokens
+        leader_rep = leader.unsqueeze(2).expand(-1, -1, 4, -1).reshape(B * 15, 4, 4)
         per_player = torch.stack(
-            [self._enc_cardset(cards[:, i, :]) for i in range(4)],
+            [self._enc_cardset(cards[:, i, :], extra=leader_rep[:, i, :]) for i in range(4)],
             dim=1,
         )                                                         # (B*15, 4, d_model)
         tokens = per_player.reshape(B, 60, self.d_model)         # (B, 60, d_model)
         tokens = tokens + self.hist_pos_enc                       # add positional encoding
-        return tokens
+        return tokens, leader
 
     def _forward_impl(self, x: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
         B, device = x.shape[0], x.device
@@ -290,7 +345,7 @@ class _TransformerBase(nn.Module):
         opp_tok     = self._enc_cardset(opp_trick).unsqueeze(1)    # (B, 1, d)
         left_tok    = self._enc_cardset(left_trick).unsqueeze(1)   # (B, 1, d)
         kitty_tok   = self._enc_cardset(kitty).unsqueeze(1)        # (B, 1, d)
-        hist_tok    = self._enc_history(history)                   # (B, 60, d)
+        hist_tok, hist_leader = self._enc_history(history)         # (B, 60, d), (B, 15, 4)
         cls         = self.cls_token.expand(B, -1, -1)             # (B, 1, d)
 
         if self.has_action:
@@ -307,14 +362,24 @@ class _TransformerBase(nn.Module):
                 dim=1,
             )  # (B, 121, d)
 
-        # ── Padding mask: hand tokens [1:55] masked where card is absent ───────
+        # ── Padding mask ────────────────────────────────────────────────────────
+        # Hand tokens [1:55] masked where a card is absent, and history tokens (always the
+        # trailing 60) masked for tricks that haven't happened yet. Those slots are
+        # front-padded with all-zero rows (Observation.historical_moves_*_tensor), which the
+        # leader one-hot makes easy to detect: a real trick always has exactly one leader bit
+        # set. Previously ~all 60 history tokens competed for attention with real ones on
+        # trick 1 of every game (§4.6).
         total = tokens.shape[1]
         key_padding_mask = torch.zeros(B, total, dtype=torch.bool, device=device)
         key_padding_mask[:, 1:55] = hand_mask  # hand always occupies positions 1..54
+        trick_is_padding = (hist_leader.sum(dim=-1) == 0)                       # (B, 15)
+        hist_pad_mask = trick_is_padding.unsqueeze(-1).expand(-1, -1, 4).reshape(B, 60)
+        key_padding_mask[:, total - 60:] = hist_pad_mask  # history always occupies the last 60
 
         # ── Transformer + output head ──────────────────────────────────────────
         out = self.transformer(tokens, src_key_padding_mask=key_padding_mask)
-        return self.head(out[:, 0, :])  # CLS token → (B, 1)
+        head_in = torch.cat([out[:, 0, :], x], dim=-1)  # CLS token + raw state (§2/E2)
+        return self.head(head_in)
 
 
 # ── Public model classes ──────────────────────────────────────────────────────
