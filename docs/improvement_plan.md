@@ -1,7 +1,7 @@
 # Where We Went Wrong, and How to Beat the LSTM
 
 **Date:** 2026-09-11
-**Companion to:** [`summary.md`](summary.md), [`experiment_1.md`](experiment_1.md), [`experiment_2.md`](experiment_2.md)
+**Companion to:** [`summary.md`](summary.md), [`experiment_1.md`](experiment_1.md), [`experiment_2.md`](experiment_2.md), [`experiment_4_runbook.md`](experiment_4_runbook.md)
 **Goal:** get the attention-based main-stage model past the LSTM baseline (94.3% level rate
 @196K games) and past the original paper (97.7% @1.2M games).
 
