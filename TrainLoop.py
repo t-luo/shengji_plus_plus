@@ -19,6 +19,50 @@ import tqdm
 import numpy as np
 from torch import nn
 
+def epsilon_at(total_games: int, epsilon_start: float, epsilon_floor: float, max_games: int) -> float:
+    """
+    Exponentially anneal epsilon from epsilon_start down to epsilon_floor as a function of the
+    *global* number of games played so far, rather than a per-actor multiplicative decay applied
+    once per local batch-of-10.
+
+    This fixes two bugs (docs/improvement_plan.md §4.3b): the old scheme reset to epsilon_start
+    on every resume (since Simulation(epsilon=epsilon_start) was constructed unconditionally), and
+    its effective decay rate depended on how many actor processes were running. Being a pure
+    function of total_games, it is correct across resumes and independent of actor count.
+    """
+    if max_games <= 0 or epsilon_start <= epsilon_floor:
+        return epsilon_floor
+    frac = min(1.0, max(0.0, total_games / max_games))
+    floor_for_interp = max(epsilon_floor, 1e-4)  # avoid a hard jump to exactly 0 for frac > 0
+    value = epsilon_start * (floor_for_interp / epsilon_start) ** frac
+    return max(epsilon_floor, value)
+
+
+def wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple:
+    "95% (default) Wilson score confidence interval for a binomial proportion. Returns (low, high)."
+    if total <= 0:
+        return (0.0, 0.0)
+    phat = successes / total
+    denom = 1 + z * z / total
+    center = phat + z * z / (2 * total)
+    margin = z * np.sqrt(phat * (1 - phat) / total + z * z / (4 * total * total))
+    return ((center - margin) / denom, (center + margin) / denom)
+
+
+def _summarize(xs: list) -> dict:
+    "Mean/max/percentile summary of a loss or grad-norm history, for stats.pkl diagnostics."
+    if not xs:
+        return {}
+    arr = np.array(xs)
+    return {
+        'mean': float(np.mean(arr)),
+        'max': float(np.max(arr)),
+        'p50': float(np.percentile(arr, 50)),
+        'p95': float(np.percentile(arr, 95)),
+        'p99': float(np.percentile(arr, 99)),
+    }
+
+
 ctx = torch.multiprocessing.get_context('spawn')
 global_main_queue = ctx.Queue(maxsize=25)
 global_chaodi_queue = ctx.Queue(maxsize=25)
@@ -27,7 +71,7 @@ global_kitty_queue = ctx.Queue(maxsize=25)
 actor_processes = []
 
 # Parallelized data sampling
-def sampler(idx: int, player: SJAgent, discount, decay_factor, global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, enable_chaodi: bool, enable_combos: bool, epsilon=0.02, reuse_times=0, oracle_duration=0, game_count=0, log_file='', combo_penalty=0.1, combo_alternation=False, epsilon_start=0.5):
+def sampler(idx: int, player: SJAgent, discount, global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, enable_chaodi: bool, enable_combos: bool, epsilon=0.02, reuse_times=0, oracle_duration=0, game_count=0, log_file='', combo_penalty=0.1, combo_alternation=False, epsilon_start=0.5, actor_process_count=1, max_games=500000, total_games_at_start=0):
     logging.getLogger().setLevel(logging.ERROR)
     # logging.basicConfig(format="%(process)d %(message)s", filename=log_file, encoding='utf-8', level=logging.DEBUG)
     train_sim = Simulation(
@@ -41,6 +85,7 @@ def sampler(idx: int, player: SJAgent, discount, decay_factor, global_main_queue
         game_count=game_count,
         combo_penalty=combo_penalty
     )
+    local_games_played = 0
     while True:
         local_main, local_declare, local_kitty, local_chaodi = [], [], [], []
         same_deck_count = 0
@@ -64,7 +109,11 @@ def sampler(idx: int, player: SJAgent, discount, decay_factor, global_main_queue
             else:
                 same_deck_count = 0
                 train_sim.reset(reuse_old_deck=False)
-        train_sim.epsilon = max(epsilon, train_sim.epsilon / decay_factor)
+        local_games_played += 10
+        # Approximate global game count assuming actors make roughly equal progress; see
+        # epsilon_at's docstring for why this is computed this way rather than as a per-actor decay.
+        global_game_estimate = total_games_at_start + local_games_played * actor_process_count
+        train_sim.epsilon = epsilon_at(global_game_estimate, epsilon_start, epsilon, max_games)
 
         # Pre-tensorize in the actor process so the main process only does GPU work
         main_tensors = player.main_module.prepare_batch_inputs(local_main) if local_main else None
@@ -113,12 +162,15 @@ def evaluator(idx: int, player1: SJAgent, player2: SJAgent, enable_chaodi: bool,
     
 
 
-def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_size: int, compare: str = None, discount=0.99, decay_factor=1.2, chaodi=True, combos=False, verbose=False, random_seed=1, single_process=False, epsilon=0.01, tau=0.995, kitty_agent='fc', eval_agent_type='random', learn_from_eval=False, reuse_times=0, oracle_duration=0, max_games=500000, combo_penalty=0.1, dynamic_encoding=True, combo_alternation=False, actor_process_count=6, eval_process_count=7, model_architecture='mlp', eval_agents=None, epsilon_start=0.5):
+def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_size: int, compare: str = None, discount=0.99, decay_factor=1.2, chaodi=True, combos=False, verbose=False, random_seed=1, single_process=False, epsilon=0.01, tau=0.995, kitty_agent='fc', eval_agent_type='random', learn_from_eval=False, reuse_times=0, oracle_duration=0, max_games=500000, combo_penalty=0.1, dynamic_encoding=True, combo_alternation=False, actor_process_count=6, eval_process_count=7, model_architecture='mlp', eval_agents=None, epsilon_start=0.5, allow_fresh_optimizer=False, lr=1e-4, optimizer_name='rmsprop', weight_decay=0.0, warmup_steps=0, grad_clip=1.0, nan_batch_threshold=100, dropout=None):
     os.makedirs(model_folder, exist_ok=True)
     torch.manual_seed(0)
     random.seed(random_seed)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     oracle_duration_input = oracle_duration
+    if decay_factor != 1.2:
+        print("NOTE: --decay-factor is deprecated and ignored — epsilon is now annealed as a "
+              "function of global games played (see epsilon_at() / docs/improvement_plan.md §4.3b).")
 
     # Copy the active Models.py to networks/ActiveModels.py so spawn child
     # processes can import it by a stable, fully-qualified module name.
@@ -137,8 +189,11 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
     stats = []
 
     if agent_type.startswith('dmc'):
-        agent = DMCAgent(model_folder, use_oracle=oracle_duration_input > 0, dynamic_encoding=dynamic_encoding, sac=agent_type.endswith('sac'))
+        agent = DMCAgent(model_folder, use_oracle=oracle_duration_input > 0, dynamic_encoding=dynamic_encoding, sac=agent_type.endswith('sac'),
+                          lr=lr, optimizer_name=optimizer_name, weight_decay=weight_decay, warmup_steps=warmup_steps,
+                          grad_clip=grad_clip, nan_batch_threshold=nan_batch_threshold, dropout=dropout)
         print(f"Using DMC model {'with' if dynamic_encoding else 'without'} dynamic encoding and " + ("with sac" if agent_type.endswith('sac') else "without sac"))
+        print(f"Optimizer: {optimizer_name} lr={lr} weight_decay={weight_decay} warmup_steps={warmup_steps} grad_clip={grad_clip} dropout={dropout}")
     elif agent_type.startswith('dqn'):
         agent = DQNAgent(model_folder, discount=discount, sac=agent_type.endswith('sac'))
         print("Using DQN model" + (" with sac" if agent_type.endswith('sac') else ""))
@@ -210,12 +265,22 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
         else:
             shutil.copyfile('networks/Models.py', f'{model_folder}/Models.py')
     except Exception as e:
-        print(f"WARNING: Failed to load optimizer states: {e}")
-        print("Model weights are loaded but optimizer state is reset — this may cause instability")
+        if allow_fresh_optimizer:
+            print(f"WARNING: Failed to load optimizer states: {e}")
+            print("--allow-fresh-optimizer passed: continuing with a freshly-initialized optimizer "
+                  "applied to trained weights. RMSprop/Adam's running variance starts at zero, so the "
+                  "first steps can be unusually large — watch grad_norm_stats in stats.pkl.")
+        else:
+            raise RuntimeError(
+                f"Failed to load optimizer state from {model_folder}/state.pkl: {e}\n"
+                "Resuming with a freshly-initialized optimizer on an already-trained network risks a "
+                "destabilizing loss spike (docs/improvement_plan.md §4.2). Pass --allow-fresh-optimizer "
+                "to proceed anyway if this is intentional (e.g. after an optimizer-affecting code change)."
+            ) from e
     
     if not eval_only:
         for i in range(1 if single_process else actor_process_count):
-            actor = ctx.Process(target=sampler, args=(i, agent, discount, decay_factor ** (1 / games), global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, chaodi, combos, epsilon, reuse_times, oracle_duration // actor_process_count, iterations // actor_process_count, f"{model_folder}/debug{i}.log", combo_penalty, combo_alternation, epsilon_start))
+            actor = ctx.Process(target=sampler, args=(i, agent, discount, global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, chaodi, combos, epsilon, reuse_times, oracle_duration // actor_process_count, iterations // actor_process_count, f"{model_folder}/debug{i}.log", combo_penalty, combo_alternation, epsilon_start, actor_process_count, max_games, iterations))
             actor.start()
             actor_processes.append(actor)
             
@@ -254,10 +319,37 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
                 print("Current alpha:", agent.main_module.log_alpha.exp().cpu().item())
                 if isinstance(agent, DQNAgent):
                     print("value loss:", np.mean(agent.main_module.value_loss_history))
+
+            # Snapshot training diagnostics before clear_loss_histories() wipes them (E0 item 3:
+            # these previously left no trace anywhere once printed, which is why past collapses
+            # like transformer_v3_c could never be root-caused after the fact).
+            nan_batches_snapshot = {
+                'declare': agent.declare_module.nan_batches,
+                'kitty': agent.kitty_module.nan_batches,
+                'chaodi': agent.chaodi_module.nan_batches,
+                'main': agent.main_module.nan_batches,
+            }
+            loss_stats_snapshot = {
+                'declare': _summarize(agent.declare_module.train_loss_history),
+                'kitty': _summarize(agent.kitty_module.train_loss_history),
+                'chaodi': _summarize(agent.chaodi_module.train_loss_history),
+                'main': _summarize(agent.main_module.train_loss_history),
+            }
+            grad_norm_stats_snapshot = {
+                'declare': _summarize(agent.declare_module.grad_norm_history),
+                'kitty': _summarize(agent.kitty_module.grad_norm_history),
+                'chaodi': _summarize(agent.chaodi_module.grad_norm_history),
+                'main': _summarize(agent.main_module.grad_norm_history),
+            }
+            if any(v for v in nan_batches_snapshot.values()):
+                print(f"nan_batches this round: {nan_batches_snapshot}")
             agent.clear_loss_histories()
-        
+
         per_opponent_stats = {}
-        games_per_eval = max(1, eval_size // len(eval_agent_list))
+        # Per opponent, not divided (docs/improvement_plan.md §3.2) — with 3 opponents and the old
+        # eval_size=300 behavior, each one only got ~100 games (±5pp 95% CI on win rate). Pass a
+        # smaller --eval-size if you want the old total-games budget.
+        games_per_eval = eval_size
 
         for opp_label, eval_agent in eval_agent_list:
             if single_process:
@@ -297,15 +389,20 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
                 for a in eval_actors:
                     a.kill()
 
+            win_total = sum(win_counts)
+            win_ci = wilson_interval(win_counts[0], win_total)
             per_opponent_stats[opp_label] = {
                 'win_counts': win_counts,
                 'level_counts': level_counts,
                 'avg_points': [float(np.mean(opposition_points[0])) if opposition_points[0] else 0.0,
                                float(np.mean(opposition_points[1])) if opposition_points[1] else 0.0],
+                'win_rate_ci95': win_ci,
+                'games': win_total,
             }
-            win_rate = win_counts[0] / sum(win_counts) if sum(win_counts) > 0 else 0
+            win_rate = win_counts[0] / win_total if win_total > 0 else 0
             lvl_rate = level_counts[0] / sum(level_counts) if sum(level_counts) > 0 else 0
-            print(f'  vs {opp_label}: win={win_rate:.1%}  level={lvl_rate:.1%}  opp_pts={per_opponent_stats[opp_label]["avg_points"]}')
+            print(f'  vs {opp_label} (n={win_total}): win={win_rate:.1%} [95% CI {win_ci[0]:.1%}-{win_ci[1]:.1%}]  '
+                  f'level={lvl_rate:.1%}  opp_pts={per_opponent_stats[opp_label]["avg_points"]}')
         
         iterations += games
 
@@ -323,6 +420,10 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
                 all_pts[0].append(s['avg_points'][0]); all_pts[1].append(s['avg_points'][1])
             stats.append({
                 "iterations": iterations,
+                # NOTE: despite the name, these two are RATES (win_counts[0]/sum(win_counts)), not
+                # counts, and are summed across whatever opponents happen to be in eval_agent_list
+                # — not comparable between runs evaluated against different opponent mixes
+                # (docs/improvement_plan.md §3.2). Prefer per_opponent for anything quantitative.
                 "win_counts": all_win[0] / sum(all_win) if sum(all_win) > 0 else 0,
                 "level_counts": all_lvl[0] / sum(all_lvl) if sum(all_lvl) > 0 else 0,
                 "avg_points": [float(np.mean(all_pts[0])), float(np.mean(all_pts[1]))],
@@ -333,6 +434,10 @@ def train(agent_type: str, games: int, model_folder: str, eval_only: bool, eval_
                 "learn_time": t_learn,
                 "avg_sim_per_game": float(np.mean(avg_sim_times)),
                 "avg_infer_per_game": float(np.mean(avg_infer_times)),
+                "epsilon": epsilon_at(iterations, epsilon_start, epsilon, max_games),
+                "nan_batches": nan_batches_snapshot,
+                "loss_stats": loss_stats_snapshot,
+                "grad_norm_stats": grad_norm_stats_snapshot,
             })
             with open(f'{model_folder}/stats.pkl', mode='w+b') as f:
                 pickle.dump(stats, f)
@@ -354,7 +459,7 @@ if __name__ == '__main__':
     parser.add_argument('--agent-type', type=str, default='dmc', choices=['dmc', 'dqn', 'dqnsac', 'dmcsac'])
     parser.add_argument('--games', type=int, default=500)
     parser.add_argument('--eval-only', action='store_true')
-    parser.add_argument('--eval-size', type=int, default=300)
+    parser.add_argument('--eval-size', type=int, default=300, help='Games to evaluate PER OPPONENT (not divided across --eval-agents)')
     parser.add_argument('--model-folder', type=str, default='pretrained')
     parser.add_argument('--compare', type=str, default='')
     parser.add_argument('--verbose', action='store_true')
@@ -380,5 +485,15 @@ if __name__ == '__main__':
     parser.add_argument('--actor-processes', type=int, default=6)
     parser.add_argument('--eval-processes', type=int, default=7)
     parser.add_argument('--model-architecture', type=str, default='mlp', choices=['mlp', 'transformer'])
+    parser.add_argument('--allow-fresh-optimizer', action='store_true',
+                         help='On a resume, fall back to a fresh optimizer if the saved state fails to load, '
+                              'instead of aborting (docs/improvement_plan.md §4.2)')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Optimizer learning rate for every stage module')
+    parser.add_argument('--optimizer', type=str, default='rmsprop', choices=['rmsprop', 'adamw'], dest='optimizer_name')
+    parser.add_argument('--weight-decay', type=float, default=0.0)
+    parser.add_argument('--warmup-steps', type=int, default=0, help='Linear LR warmup steps (optimizer steps, not games); not persisted across resumes')
+    parser.add_argument('--grad-clip', type=float, default=1.0, help='Max grad norm (was a no-op at 80; see §4.10)')
+    parser.add_argument('--nan-batch-threshold', type=int, default=100, help='Abort if a single stage module hits this many non-finite-loss batches')
+    parser.add_argument('--dropout', type=float, default=None, help='Override MainModel/ValueModel dropout (transformer only; ignored by the LSTM)')
     args = parser.parse_args()
-    train(args.agent_type, args.games, args.model_folder, args.eval_only, args.eval_size, args.compare, args.discount, args.decay_factor, not args.disable_chaodi, args.enable_combos, args.verbose, args.random_seed, args.single_process, args.epsilon, args.tau, args.kitty_agent, args.eval_agent, args.learn_from_eval, args.reuse_times, args.oracle_duration, args.max_games, args.combo_penalty, not args.static_encoding, args.combo_alternation, args.actor_processes, args.eval_processes, args.model_architecture, args.eval_agents, args.epsilon_start)
+    train(args.agent_type, args.games, args.model_folder, args.eval_only, args.eval_size, args.compare, args.discount, args.decay_factor, not args.disable_chaodi, args.enable_combos, args.verbose, args.random_seed, args.single_process, args.epsilon, args.tau, args.kitty_agent, args.eval_agent, args.learn_from_eval, args.reuse_times, args.oracle_duration, args.max_games, args.combo_penalty, not args.static_encoding, args.combo_alternation, args.actor_processes, args.eval_processes, args.model_architecture, args.eval_agents, args.epsilon_start, args.allow_fresh_optimizer, args.lr, args.optimizer_name, args.weight_decay, args.warmup_steps, args.grad_clip, args.nan_batch_threshold, args.dropout)
