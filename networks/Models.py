@@ -157,8 +157,10 @@ class MainModel(nn.Module):
         - Cards played in the current round by every other player, and the position of the player that is leading the round
         - Kitty (if the player is the last to place the kitty), shape (108,)
     """
-    def __init__(self, use_oracle=False) -> None:
+    def __init__(self, use_oracle=False, dropout=None) -> None:
         super().__init__()
+        # dropout is accepted-and-ignored for interface parity with
+        # networks/TransformerModels.py's MainModel, which does use it.
 
         self.use_oracle = use_oracle
         self.lstm = nn.LSTM(436, 256, batch_first=True)

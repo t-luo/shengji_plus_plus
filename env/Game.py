@@ -142,7 +142,7 @@ class Game:
             declaration = self.declarations[-1].relative_to(position) if self.declarations else None,
             next_declaration_turn = self.current_declaration_turn.relative_to(position) if self.current_declaration_turn else None,
             dealer_position = self.dealer_position.relative_to(position) if self.dealer_position else None,
-            defender_points = self.opponent_points,
+            defender_points = self.defender_points,
             opponent_points = self.opponent_points,
             round_history = [(p.relative_to(position), cards[:]) for p, cards in self.round_history],
             unplayed_cards = self.unplayed_cards.copy(),

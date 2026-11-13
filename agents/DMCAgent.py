@@ -27,17 +27,71 @@ class DMCModule(StageModule):
         self._eval_model: nn.Module = None # don't set directly
         self.loss_fn = nn.MSELoss()
         self.train_loss_history: List[float] = []
+        self.grad_norm_history: List[float] = []
         self.optimizer: torch.optim.Optimizer = None
         self.dynamic_encoding = dynamic_encoding
         self._last_inference_ms: float = 0.0
+        self.nan_batches = 0 # cumulative count of non-finite-loss batches skipped, for the lifetime of the process
+        self.grad_clip = 1.0
+        self.warmup_steps = 0
+        self.base_lr = 1e-4
+        self.nan_batch_threshold = 100
+        self._step_count = 0
 
     # Use this function to load a pretrained model
-    def load_model(self, model: nn.Module):
+    def load_model(self, model: nn.Module, lr=1e-4, optimizer_name='rmsprop', weight_decay=0.0,
+                    warmup_steps=0, grad_clip=1.0, nan_batch_threshold=100):
         self._model = model
         self._model.share_memory()
         self._eval_model = copy.deepcopy(model)
         self._eval_model.eval().share_memory()
-        self.optimizer = torch.optim.RMSprop(model.parameters(), lr=0.0001, alpha=0.99, eps=1e-5)
+        self.grad_clip = grad_clip
+        self.warmup_steps = warmup_steps
+        self.base_lr = lr
+        self.nan_batch_threshold = nan_batch_threshold
+        self._step_count = 0
+        if optimizer_name == 'adamw':
+            self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        else:
+            self.optimizer = torch.optim.RMSprop(model.parameters(), lr=lr, alpha=0.99, eps=1e-5, weight_decay=weight_decay)
+
+    def _apply_warmup(self):
+        "Linear LR warmup over self.warmup_steps optimizer steps. Not persisted across resumes (restarts each process)."
+        if self.warmup_steps and self._step_count < self.warmup_steps:
+            scale = (self._step_count + 1) / self.warmup_steps
+            for g in self.optimizer.param_groups:
+                g['lr'] = self.base_lr * scale
+        elif self.warmup_steps and self._step_count == self.warmup_steps:
+            for g in self.optimizer.param_groups:
+                g['lr'] = self.base_lr
+        self._step_count += 1
+
+    def _step_optimizer(self, loss: torch.Tensor):
+        """
+        Shared backward/step logic used by every learn_from_* method.
+        On a non-finite loss, skip the batch (never randomize weights — see
+        docs/improvement_plan.md §4.1) and abort loudly if this keeps happening, rather than
+        silently corrupting the model for the rest of the run.
+        """
+        self.optimizer.zero_grad()
+        loss.backward()
+        if not torch.isfinite(loss):
+            self.nan_batches += 1
+            self.optimizer.zero_grad(set_to_none=True)
+            print(f"WARNING: {self} encountered a non-finite loss (total={self.nan_batches}), skipping batch.")
+            if self.nan_batches > self.nan_batch_threshold:
+                raise RuntimeError(
+                    f"{self} exceeded {self.nan_batch_threshold} non-finite-loss batches this run — aborting. "
+                    "Resume from the last checkpoint rather than continuing to train on a diverged model."
+                )
+            return False
+        else:
+            self._apply_warmup()
+            grad_norm = nn.utils.clip_grad_norm_(self._model.parameters(), self.grad_clip)
+            self.optimizer.step()
+            self.train_loss_history.append(loss.detach().item())
+            self.grad_norm_history.append(float(grad_norm))
+            return True
 
     # Helper function to prepare `Observation` and `Action` objects into CPU tensors.
     # Returns a tuple of CPU tensors: (*args, rewards)
@@ -56,18 +110,7 @@ class DMCModule(StageModule):
             rewards = rewards.to(device)
             pred = self._model(*args)
             loss = self.loss_fn(pred, rewards)
-            self.optimizer.zero_grad()
-            loss.backward()
-            if torch.isnan(loss):
-                def init_weights(m):
-                    if isinstance(m, nn.Linear):
-                        nn.init.xavier_uniform_(m.weight.data)
-                self._model.apply(init_weights)
-                print(f"Model {self} encountered nan, reset weights to random.")
-            else:
-                nn.utils.clip_grad_norm_(self._model.parameters(), 80)
-                self.optimizer.step()
-                self.train_loss_history.append(loss.detach().item())
+            self._step_optimizer(loss)
 
         for param, target_param in zip(self._model.parameters(), self._eval_model.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
@@ -89,18 +132,7 @@ class DMCModule(StageModule):
             batch_rewards = rewards[idx_chunk]
             pred = self._model(*batch_args)
             loss = self.loss_fn(pred, batch_rewards)
-            self.optimizer.zero_grad()
-            loss.backward()
-            if torch.isnan(loss):
-                def init_weights(m):
-                    if isinstance(m, nn.Linear):
-                        nn.init.xavier_uniform_(m.weight.data)
-                self._model.apply(init_weights)
-                print(f"Model {self} encountered nan, reset weights to random.")
-            else:
-                nn.utils.clip_grad_norm_(self._model.parameters(), 80)
-                self.optimizer.step()
-                self.train_loss_history.append(loss.detach().item())
+            self._step_optimizer(loss)
 
         for param, target_param in zip(self._model.parameters(), self._eval_model.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
@@ -256,24 +288,65 @@ class MainModule(DMCModule):
             gt_rewards[i] = rw
         return x_batch, history_batch, current_action_entropy, next_action_entropy, gt_rewards  # CPU tensors
 
+    def _prepare_act_batch(self, obs: Observation) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Optimized path for act(): builds the same (x_batch, history_batch) pair as
+        prepare_batch_inputs([(obs, a, 0, None) for a in obs.actions]), but computes the
+        state/history tensors that are shared across every candidate action exactly once
+        instead of once per action. historical_moves_dynamic_tensor in particular loops over
+        up to 60 card sets per call, so this used to be the dominant cost of main-stage
+        inference (docs/improvement_plan.md §5).
+        """
+        historical_moves, current_moves = obs.historical_moves_dynamic_tensor if self.dynamic_encoding else obs.historical_moves_tensor
+        shared_state = torch.cat([
+            obs.dynamic_hand_tensor if self.dynamic_encoding else obs.hand.tensor, # (108,)
+            obs.dealer_position_tensor, # (4,)
+            obs.trump_tensor, # (20,)
+            obs.declarer_position_tensor, # (4,)
+            obs.chaodi_times_tensor, # (4,)
+            obs.points_tensor, # (80,)
+            obs.unplayed_cards_dynamic_tensor if self.dynamic_encoding else obs.unplayed_cards_tensor, # (108,)
+            current_moves, # (328,)
+            obs.kitty_dynamic_tensor if self.dynamic_encoding else obs.kitty_tensor, # (108,)
+        ])
+        if self.use_oracle:
+            # Matches prepare_batch_inputs' default (training=True) branch, which is what
+            # act() has always invoked since it never forwards its own `training` flag through.
+            shared_state = torch.cat([obs.oracle_cardsets, shared_state])
+
+        n = len(obs.actions)
+        x_batch = torch.zeros((n, shared_state.shape[0] + 1 + 108))
+        for i, ac in enumerate(obs.actions):
+            dominates = obs.dominates_all_tensor(ac.cardset)
+            action_tensor = ac.dynamic_tensor(obs.dominant_suit, obs.dominant_rank) if self.dynamic_encoding else ac.tensor
+            x_batch[i] = torch.cat([shared_state, dominates, action_tensor])
+
+        history_batch = historical_moves.unsqueeze(0).expand(n, -1, -1)
+        return x_batch, history_batch
+
     def act(self, obs: Observation, epsilon=None, training=True):
-        x_batch, history_batch, *_ = self.prepare_batch_inputs([(obs, a, 0, None) for a in obs.actions])
+        x_batch, history_batch = self._prepare_act_batch(obs)
         rewards = self._eval_in_chunks([x_batch, history_batch])
         action_distribution = np.exp(rewards) / np.sum(np.exp(rewards))
-        entropy = -np.mean(action_distribution * np.log2(action_distribution))
+        entropy = -np.sum(action_distribution * np.log2(action_distribution))
         optimal_index = np.argmax(rewards)
+
+        # epsilon-greedy: previously both branches returned the argmax, so the main stage
+        # never actually explored (docs/improvement_plan.md §4.3a).
         if epsilon and random.random() < epsilon:
-            # If in verbose mode, log actions and their probabilities in test time
-            if not training and logging.getLogger().level == logging.DEBUG:
-                logging.debug("Probability of actions:")
-                sorted_actions = sorted(zip(obs.actions, rewards), key=lambda x: x[1], reverse=True)
-                for i, (action, rw) in enumerate(sorted_actions):
-                    logging.debug(f"{i:2}. {action} (reward={round(rw, 4)})")
-                return sorted_actions[0], action_distribution[optimal_index], entropy
-            else:
-                return obs.actions[optimal_index], action_distribution[optimal_index], entropy
+            chosen_index = random.randrange(len(obs.actions))
         else:
-            return obs.actions[optimal_index], action_distribution[optimal_index], entropy
+            chosen_index = optimal_index
+
+        # If in verbose mode, log actions and their probabilities in test time
+        if not training and logging.getLogger().level == logging.DEBUG:
+            logging.debug(f"Probability of actions ({obs.position.value}):")
+            sorted_actions = sorted(zip(obs.actions, rewards), key=lambda x: x[1], reverse=True)
+            exp_total = np.sum(np.exp(rewards))
+            for i, (action, rw) in enumerate(sorted_actions):
+                logging.debug(f"{i:2}. {action} (reward={round(rw, 4)}, prob={np.exp(rw) / exp_total:.4f})")
+
+        return obs.actions[chosen_index], action_distribution[optimal_index], entropy
 
     def learn_from_samples(self, samples: List[Tuple[Observation, Action, float, Tuple[Observation, float, float]]]):
         if not samples:
@@ -287,19 +360,11 @@ class MainModule(DMCModule):
             next_action_entropy = next_action_entropy.to(device)
             rewards = rewards.to(device)
             pred = self._model(*args)
-            loss = self.loss_fn(pred, rewards + torch.exp(self.log_alpha) * next_action_entropy.unsqueeze(1))
-            self.optimizer.zero_grad()
-            loss.backward()
-            if torch.isnan(loss):
-                def init_weights(m):
-                    if isinstance(m, nn.Linear):
-                        nn.init.xavier_uniform_(m.weight.data)
-                self._model.apply(init_weights)
-                print(f"Model {self} encountered nan, reset weights to random.")
-            else:
-                nn.utils.clip_grad_norm_(self._model.parameters(), 80)
-                self.optimizer.step()
-                self.train_loss_history.append(loss.detach().item())
+            # The entropy bonus is only part of the target under SAC; otherwise this is plain DMC
+            # regression onto the Monte Carlo return (see docs/improvement_plan.md §4.8).
+            target = rewards + torch.exp(self.log_alpha) * next_action_entropy.unsqueeze(1) if self.sac else rewards
+            loss = self.loss_fn(pred, target)
+            self._step_optimizer(loss)
 
             # Update alpha
             if self.sac:
@@ -326,19 +391,9 @@ class MainModule(DMCModule):
         indices = torch.randperm(n)
         for idx_chunk in torch.chunk(indices, max(1, n // self.batch_size)):
             pred = self._model(x_batch[idx_chunk], history_batch[idx_chunk])
-            loss = self.loss_fn(pred, rewards[idx_chunk] + torch.exp(self.log_alpha) * next_action_entropy[idx_chunk].unsqueeze(1))
-            self.optimizer.zero_grad()
-            loss.backward()
-            if torch.isnan(loss):
-                def init_weights(m):
-                    if isinstance(m, nn.Linear):
-                        nn.init.xavier_uniform_(m.weight.data)
-                self._model.apply(init_weights)
-                print(f"Model {self} encountered nan, reset weights to random.")
-            else:
-                nn.utils.clip_grad_norm_(self._model.parameters(), 80)
-                self.optimizer.step()
-                self.train_loss_history.append(loss.detach().item())
+            target = rewards[idx_chunk] + torch.exp(self.log_alpha) * next_action_entropy[idx_chunk].unsqueeze(1) if self.sac else rewards[idx_chunk]
+            loss = self.loss_fn(pred, target)
+            self._step_optimizer(loss)
 
             if self.sac:
                 alpha_loss = self.log_alpha.exp() * torch.mean(current_action_entropy[idx_chunk]) + self.log_alpha.exp() * 10
@@ -351,7 +406,9 @@ class MainModule(DMCModule):
 
 
 class DMCAgent(SJAgent):
-    def __init__(self, name: str, use_oracle: bool, dynamic_encoding=True, sac=False) -> None:
+    def __init__(self, name: str, use_oracle: bool, dynamic_encoding=True, sac=False, lr=1e-4,
+                 optimizer_name='rmsprop', weight_decay=0.0, warmup_steps=0, grad_clip=1.0,
+                 nan_batch_threshold=100, dropout=None) -> None:
         super().__init__(name)
 
         self.declare_module: DeclareModule = DeclareModule(batch_size=64, dynamic_encoding=dynamic_encoding)
@@ -360,6 +417,15 @@ class DMCAgent(SJAgent):
         self.main_module: MainModule = MainModule(batch_size=64, use_oracle=use_oracle, dynamic_encoding=dynamic_encoding, sac=sac)
         self.dynamic_encoding = dynamic_encoding
         self.sac = sac
+        # Optimizer/regularization config, applied uniformly to every stage module's optimizer
+        # when models are (re)loaded. See docs/improvement_plan.md §4.10 and E1.
+        self.lr = lr
+        self.optimizer_name = optimizer_name
+        self.weight_decay = weight_decay
+        self.warmup_steps = warmup_steps
+        self.grad_clip = grad_clip
+        self.nan_batch_threshold = nan_batch_threshold
+        self.dropout = dropout # None = use the model class's own default; only MainModel/ValueModel accept this
 
     def optimizer_states(self):
         return {
@@ -382,30 +448,33 @@ class DMCAgent(SJAgent):
 
     def load_models_from_disk(self, train_models):
         # Load models for DMC
+        optim_kwargs = dict(lr=self.lr, optimizer_name=self.optimizer_name, weight_decay=self.weight_decay,
+                             warmup_steps=self.warmup_steps, grad_clip=self.grad_clip,
+                             nan_batch_threshold=self.nan_batch_threshold)
         loaded_models = True
         declare_model: nn.Module = train_models.DeclarationModel().cuda()
         if os.path.exists(f'{self.name}/declare.pt'):
-            declare_model.load_state_dict(torch.load(f'{self.name}/declare.pt', map_location='cuda', weights_only=True), strict=False)
+            declare_model.load_state_dict(torch.load(f'{self.name}/declare.pt', map_location='cuda', weights_only=True), strict=True)
             print("Using loaded model for declaration")
         else:
             loaded_models = False
-        self.declare_module.load_model(declare_model)
+        self.declare_module.load_model(declare_model, **optim_kwargs)
 
         kitty_model: nn.Module = train_models.KittyModel().cuda()
         if os.path.exists(f'{self.name}/kitty.pt'):
-            kitty_model.load_state_dict(torch.load(f'{self.name}/kitty.pt', map_location='cuda', weights_only=True), strict=False)
+            kitty_model.load_state_dict(torch.load(f'{self.name}/kitty.pt', map_location='cuda', weights_only=True), strict=True)
             print("Using loaded model for kitty")
         else:
             loaded_models = False
-        self.kitty_module.load_model(kitty_model)
+        self.kitty_module.load_model(kitty_model, **optim_kwargs)
 
         chaodi_model: nn.Module = train_models.ChaodiModel().cuda()
         if os.path.exists(f'{self.name}/chaodi.pt'):
-            chaodi_model.load_state_dict(torch.load(f'{self.name}/chaodi.pt', map_location='cuda', weights_only=True), strict=False)
+            chaodi_model.load_state_dict(torch.load(f'{self.name}/chaodi.pt', map_location='cuda', weights_only=True), strict=True)
             print("Using loaded model for chaodi")
         else:
             loaded_models = False
-        self.chaodi_module.load_model(chaodi_model)
+        self.chaodi_module.load_model(chaodi_model, **optim_kwargs)
 
         try:
             state = torch.load(f'{self.name}/state.pkl', map_location='cpu', weights_only=False)
@@ -418,13 +487,14 @@ class DMCAgent(SJAgent):
             print(f"Resuming with remaining oracle duration {oracle_duration}")
         except Exception as e:
             loaded_models = False
-        main_model: nn.Module = train_models.MainModel(use_oracle=self.main_module.use_oracle).cuda()
+        main_model_kwargs = {} if self.dropout is None else {'dropout': self.dropout}
+        main_model: nn.Module = train_models.MainModel(use_oracle=self.main_module.use_oracle, **main_model_kwargs).cuda()
         if os.path.exists(f'{self.name}/main.pt'):
-            main_model.load_state_dict(torch.load(f'{self.name}/main.pt', map_location='cuda', weights_only=True), strict=False)
+            main_model.load_state_dict(torch.load(f'{self.name}/main.pt', map_location='cuda', weights_only=True), strict=True)
             print("Using loaded model for main game")
         else:
             loaded_models = False
-        self.main_module.load_model(main_model)
+        self.main_module.load_model(main_model, **optim_kwargs)
 
         device = next(main_model.parameters()).device
         self.main_module.log_alpha = self.main_module.log_alpha.to(device).detach().requires_grad_(True)
@@ -456,3 +526,7 @@ class DMCAgent(SJAgent):
         self.kitty_module.train_loss_history.clear()
         self.chaodi_module.train_loss_history.clear()
         self.main_module.train_loss_history.clear()
+        self.declare_module.grad_norm_history.clear()
+        self.kitty_module.grad_norm_history.clear()
+        self.chaodi_module.grad_norm_history.clear()
+        self.main_module.grad_norm_history.clear()
