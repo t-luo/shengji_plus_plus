@@ -1,5 +1,6 @@
 import importlib
 import logging
+import math
 import pickle
 import random
 import shutil
@@ -45,8 +46,8 @@ def wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple:
     phat = successes / total
     denom = 1 + z * z / total
     center = phat + z * z / (2 * total)
-    margin = z * np.sqrt(phat * (1 - phat) / total + z * z / (4 * total * total))
-    return ((center - margin) / denom, (center + margin) / denom)
+    margin = z * math.sqrt(phat * (1 - phat) / total + z * z / (4 * total * total))
+    return (float((center - margin) / denom), float((center + margin) / denom))
 
 
 def _summarize(xs: list) -> dict:
