@@ -101,7 +101,6 @@ class MainModule(StageModule):
                             optimal_actions.append(action)
                         else:
                             second_best_actions.append(action)
-                    print(action.move)
                 elif action.move.cardset.count_suit(CardSuit.TRUMP, obs.dominant_suit, obs.dominant_rank) == 0:
                     min_rank = d[0].cardset.min_rank(obs.dominant_suit, obs.dominant_rank)
                     if isinstance(d[0], MoveType.Tractor) or isinstance(d[0], MoveType.Pair) and min_rank >= 8 and isinstance(d[0], MoveType.Single) and (min_rank == 14 or obs.dominant_rank == 14 and min_rank == 13):
